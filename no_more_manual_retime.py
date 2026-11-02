@@ -8561,7 +8561,8 @@ def _record_cache_dir(path):
         if not _owned_temp_kind_root(root, 'cache') or os.path.islink(path):
             raise RuntimeError(_t('cache 경로의 소유 경계를 확인할 수 없습니다: %s', 'Cannot verify the cache ownership boundary: %s') % path)
     path = os.path.realpath(path).replace('\\', '/')
-    if owned_shape and os.path.dirname(path) != os.path.realpath(root):
+    # path uses '/' from here on, while realpath() returns '\' on Windows: compare them as paths, not strings.
+    if owned_shape and os.path.normcase(os.path.dirname(path)) != os.path.normcase(os.path.realpath(root)):
         raise RuntimeError(_t('cache 경로가 외부 위치를 가리킵니다: %s', 'Cache path points outside its folder: %s') % path)
     _USED_DIRS.add(path)
     return path
