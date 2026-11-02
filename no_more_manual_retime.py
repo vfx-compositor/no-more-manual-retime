@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# No More Manual Retime 1.0.1
+# No More Manual Retime 1.0.2
 # Copyright (c) 2026 Jumin Park. MIT License, see LICENSE.
 # https://github.com/vfx-compositor/no-more-manual-retime
 # Usage: paste this file into the Nuke Script Editor and run it,
@@ -1134,8 +1134,8 @@ def _console(text):
         print('[No More Manual Retime] ' + str(text))
 
 
-NMMR_VERSION = '1.0.1'
-NMMR_RELEASE_VERSION = '1.0.1'
+NMMR_VERSION = '1.0.2'
+NMMR_RELEASE_VERSION = '1.0.2'
 NMMR_DISPLAY_VERSION = NMMR_RELEASE_VERSION
 
 NODE_PREFIX = 'NMMR_'

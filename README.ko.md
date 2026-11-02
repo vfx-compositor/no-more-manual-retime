@@ -21,7 +21,7 @@ EDL, XML, 일치하는 타임코드가 필요 없습니다. 실제로 받는 오
 
 `no_more_manual_retime.py` 파일 하나만 있으면 됩니다.
 
-- **Releases:** [Releases 페이지](../../releases)의 최신 `no_more_manual_retime_v1.0.1.zip` (도구 파일, README, 라이선스).
+- **Releases:** [Releases 페이지](../../releases)의 최신 `no_more_manual_retime_v1.0.2.zip` (도구 파일, README, 라이선스).
 - **단일 파일:** 이 저장소의 `no_more_manual_retime.py`. **Raw** 보기에서 복사하세요.
 
 ## 설치

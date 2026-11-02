@@ -21,7 +21,7 @@ The result is one TimeWarp node. A change that speed cannot explain, such as a c
 
 All you need is the single file `no_more_manual_retime.py`.
 
-- **Releases:** the latest `no_more_manual_retime_v1.0.1.zip` from the [Releases page](../../releases) (the tool file, README, license).
+- **Releases:** the latest `no_more_manual_retime_v1.0.2.zip` from the [Releases page](../../releases) (the tool file, README, license).
 - **Single file:** `no_more_manual_retime.py` in this repository. Use the **Raw** view to copy it.
 
 ## Install
