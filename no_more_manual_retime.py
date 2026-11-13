@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# No More Manual Retime 1.0.2
+# No More Manual Retime 1.1.0
 # Copyright (c) 2026 Jumin Park. MIT License, see LICENSE.
 # https://github.com/vfx-compositor/no-more-manual-retime
 # Usage: paste this file into the Nuke Script Editor and run it,
@@ -15,6 +15,8 @@ import hashlib
 import tempfile
 import math
 import time
+import threading
+from collections import namedtuple
 
 import sys
 
@@ -44,14 +46,34 @@ def _system_ui_language(locale_name=None, environ=None):
     if requested:
         return requested
     if locale_name is None:
-        locale_name = env.get('LC_ALL') or env.get('LC_MESSAGES') or env.get('LANG')
-        if not locale_name:
+        locale_name = env.get('LC_ALL') or env.get('LC_MESSAGES') or env.get('LANG') or env.get('LANGUAGE')
+        if environ is None and not _normalize_ui_language(locale_name):
+            locale_name = _os_ui_locale_name() or locale_name  # no usable LANG (Finder / Start menu launch): ask the OS
+        if not locale_name and environ is None:
             try:
                 import locale
                 locale_name = locale.getlocale()[0] or locale.getdefaultlocale()[0]
             except Exception:
                 locale_name = ''
     return 'ko' if _normalize_ui_language(locale_name) == 'ko' else 'en'
+
+
+def _os_ui_locale_name():
+    """The OS display language, or '' when it cannot be read. A Nuke started from Finder or the Start menu has no
+    LANG, so macOS reads AppleLanguages and Windows reads the user UI language; Linux falls back to the environment."""
+    try:
+        if sys.platform == 'darwin':
+            import subprocess
+            out = subprocess.check_output(['defaults', 'read', '-g', 'AppleLanguages'], timeout=3)
+            m = re.search(r'"?([A-Za-z]{2,3}(?:[-_][A-Za-z0-9]+)*)"?', out.decode('utf-8', 'replace').replace('(', ' ', 1))
+            return m.group(1) if m else ''
+        if sys.platform.startswith('win'):
+            import ctypes
+            lang_id = ctypes.windll.kernel32.GetUserDefaultUILanguage()
+            return {0x12: 'ko'}.get(lang_id & 0x3ff, 'other')  # primary language id 0x12 = Korean
+    except Exception:
+        pass
+    return ''
 
 
 def ui_language(saved=_LANGUAGE_UNSET, locale_name=None, environ=None):
@@ -77,11 +99,200 @@ def set_ui_language(value, persist=True):
     return language
 
 
+_T_PAIRS = {}  # text -> (ko, en) for every _t() pair seen; None marks a text shared by different pairs
+
+
 def _t(ko, en=None):
     """Explicit translation boundary for authored visible text only."""
-    if ui_language() == 'ko':
-        return str(ko)
-    return str(en if en is not None else ko)
+    ko_text = str(ko)
+    en_text = str(en if en is not None else ko)
+    for text in (ko_text, en_text):
+        _T_PAIRS[text] = (ko_text, en_text) if _T_PAIRS.get(text, (ko_text, en_text)) == (ko_text, en_text) else None
+    return ko_text if ui_language() == 'ko' else en_text
+
+
+def _t_rendered(text):
+    """Re-render a text that _t() produced in the other language; unknown or ambiguous text is returned unchanged."""
+    pair = _T_PAIRS.get(text)
+    if pair is None:
+        return text
+    return pair[0] if ui_language() == 'ko' else pair[1]
+
+
+class _korean_scope(object):
+    """Build stored (language-neutral) Korean state strings while the UI language is English; display translates them."""
+    def __enter__(self):
+        global _UI_LANGUAGE
+        self._saved = _UI_LANGUAGE
+        _UI_LANGUAGE = 'ko'
+        return self
+
+    def __exit__(self, *exc):
+        global _UI_LANGUAGE
+        _UI_LANGUAGE = self._saved
+        return False
+
+
+# progress heartbeat: tells "working" from "stuck"
+HEARTBEAT_STALL_SEC = 8.0  # no heartbeat for this long = the run looks stuck (shimmer stops, status line says so)
+HEARTBEAT_POLL_MS = 100  # shimmer / stall poll interval of the window timer
+HEARTBEAT_SWEEP_SEC = 1.6  # one sweep of the shimmer across the bar
+
+
+class Heartbeat(object):
+    """Last-progress clock. beat() stays cheap so work loops can call it for every frame/step.
+    While a window is busy it also sets `pulse`: a beat that arrives at least `pulse_every` seconds after the
+    last pulse repaints the bar from the caller's own stack, so the shimmer keeps moving even when the Qt timer
+    cannot fire because the main thread sits in a long Nuke call (nuke.execute frames, QC render chunks)."""
+
+    def __init__(self, clock=None, stall_after=HEARTBEAT_STALL_SEC, pulse_every=HEARTBEAT_POLL_MS / 1000.0):
+        self._clock = clock or time.time
+        self.stall_after = float(stall_after)
+        self.pulse = None  # callable(now) set by the window while a job runs
+        self.pulse_every = float(pulse_every)
+        self.pulse_count = 0
+        self._pulsed = float('-inf')
+        self.gap = 0.0  # longest silence ended by a beat since take_gap() (only silences >= stall_after)
+        self.active = False  # a job is running; silences between jobs are never reported as stalls
+        self.paused = 0  # > 0 while the job waits for the user (a modal question)
+        self.last = self._clock()
+
+    def start(self):
+        """A job starts: the silence clock restarts now and stalls are tracked until stop()."""
+        self.last = self._clock()
+        self.gap = 0.0
+        self.paused = 0
+        self.active = True
+
+    def stop(self):
+        """The job ended or was cancelled: no stall is tracked or reported until the next start()."""
+        self.active = False
+        self.gap = 0.0
+
+    def pause(self):
+        """The job waits for the user (a confirmation dialog): that wait is not a stall."""
+        self.paused += 1
+
+    def resume(self):
+        """The user answered: the silence clock restarts now."""
+        self.paused = max(0, self.paused - 1)
+        self.last = self._clock()
+
+    def beat(self):
+        now = self._clock()
+        if self.active and not self.paused and now - self.last >= self.stall_after:
+            self.gap = max(self.gap, now - self.last)
+        self.last = now
+        if self.pulse is not None and now - self._pulsed >= self.pulse_every:
+            self._pulsed = now
+            try:
+                if threading.current_thread() is threading.main_thread():  # Qt widgets are painted from the main thread only
+                    self.pulse_count += 1
+                    self.pulse(now)
+            except Exception:
+                pass
+
+    def take_gap(self):
+        """Seconds of the last stall that just ended (0 when none), cleared on read."""
+        gap, self.gap = self.gap, 0.0
+        return gap
+
+    def idle(self):
+        if self.paused:
+            return 0.0
+        return max(0.0, self._clock() - self.last)
+
+    def stalled(self):
+        return self.idle() >= self.stall_after
+
+
+_HEARTBEAT = Heartbeat()
+
+
+def heartbeat():
+    """Mark progress now (analysis / OCR / solve steps, render frames, QC render chunks)."""
+    _HEARTBEAT.beat()
+
+
+def _paused_ask(ask):
+    """Wrap a job's question callback: the heartbeat pauses while the modal dialog waits for the user."""
+    def paused(msg):
+        _HEARTBEAT.pause()
+        try:
+            return ask(msg)
+        finally:
+            _HEARTBEAT.resume()
+    return paused
+
+
+def stall_status_text(base, idle):
+    """Status line while stuck: the last message plus the plain-text age of the last progress."""
+    tail = _t('마지막 진행 %d초 전', 'last progress %d s ago') % int(idle)
+    return (base + '  ·  ' + tail) if base else tail
+
+
+def _hb_gap_text(msg):
+    """Message plus the plain-text length of a stall that just ended (silences over HEARTBEAT_STALL_SEC), once."""
+    gap = _HEARTBEAT.take_gap()
+    return stall_status_text(msg, gap) if gap >= _HEARTBEAT.stall_after else msg
+
+
+def shimmer_phase(now, sweep=HEARTBEAT_SWEEP_SEC):
+    """0..1 position of the shimmer band along the bar for a wall-clock time."""
+    return (now % sweep) / sweep
+
+
+def reduce_motion_requested(env=None, runner=None):
+    """True when animation should be replaced by a static display. NMMR_REDUCE_MOTION overrides; otherwise macOS Reduce Motion.
+    Any failure to read the setting means animation stays on (the caller still has the stall text)."""
+    env = os.environ if env is None else env
+    forced = str(env.get('NMMR_REDUCE_MOTION', '')).strip().lower()
+    if forced in ('1', 'true', 'yes', 'on'):
+        return True
+    if forced in ('0', 'false', 'no', 'off'):
+        return False
+    if sys.platform != 'darwin' and runner is None:
+        return False
+    try:
+        if runner is None:
+            import subprocess
+            runner = lambda: subprocess.check_output(
+                ['defaults', 'read', 'com.apple.universalaccess', 'reduceMotion'],
+                stderr=subprocess.STDOUT, timeout=1).decode('utf-8', 'ignore')
+        return str(runner()).strip() in ('1', 'true')
+    except Exception:
+        return False
+
+
+class _frame_heartbeat(object):
+    """Beat on every rendered frame of nuke.execute (Nuke's own before-frame-render hook). No-op where the hook is missing."""
+
+    def __enter__(self):
+        self._on = False
+        try:
+            nuke.addBeforeFrameRender(heartbeat)
+            self._on = True
+        except Exception:
+            pass
+        heartbeat()
+        return self
+
+    def __exit__(self, *exc):
+        if self._on:
+            try:
+                nuke.removeBeforeFrameRender(heartbeat)
+            except Exception:
+                pass
+        heartbeat()
+        return False
+
+
+_SINGULAR_EN = re.compile(r'(?<![\d.,/-])1 ((?:existing )?(?:frame|shot|plate|range|location|Write|row))s\b')
+
+
+def _singular(text):
+    """English count strings: '1 frames' -> '1 frame'. Korean text is returned unchanged."""
+    return _SINGULAR_EN.sub(r'1 \1', text) if ui_language() == 'en' else text
 
 
 def _contains_hangul(text):
@@ -105,6 +316,10 @@ def frame_accuracy_text(res, korean=None):
     """One line: measured TC agreement, or a plain statement that frame accuracy is unknown.
     True frame accuracy needs ground truth, so no number is shown without adopted TC."""
     ko = ui_language() != 'en' if korean is None else korean
+    if (res.get('tc') or {}).get('mode') == TC_MODE_ONLY:
+        # TC only has no independent check: agreement with itself is not frame accuracy
+        return ('프레임 정확도: TC만(이미지 검증 없음), QC로 확인' if ko else
+                'Frame accuracy: TC only (no image verification), check QC')
     pair = tc_agreement(res)
     if pair:
         pct = int(100.0 * pair[0] / pair[1])  # floor: never shows 100% with a miss
@@ -167,14 +382,14 @@ _UI_TEXT_EN = {
     'JPEG 시퀀스 (이름.####.jpg 폴더)': 'JPEG sequence (name.####.jpg folder)',
     '노드그래프에서 지금 선택한 Read 를 이 창의 EDIT / PLATE 입력으로 지정합니다. 창을 연 뒤 선택을 바꿨을 때 누릅니다.\n· MP 1개 → 그 샷 기준 (경로 설정이 있으면 최신 편집본 자동)\n· MP + 편집본 mov → 둘 다 그대로\n· MP 여러 개, 같은 샷 → 분할합성\n· MP 여러 개, 다른 샷 → 배치 탭':
         'Assign the Reads currently selected in the Node Graph as the EDIT / PLATE inputs of this window. Press this after changing the selection with the window open.\n· One plate → its shot context (latest edit if Path setup is configured)\n· Plate + edit movie → use both\n· Multiple plates, same shot → split composite\n· Multiple plates, different shots → Batch tab',
-    '경로 설정 (⌘, / Ctrl+,)\n샷 문맥 · 플레이트 · 편집본 폴더 구조를 경로 템플릿으로 지정합니다.\n설정 전에는 공유 폴더 탐색이 꺼져 있고 씬의 Read 만 씁니다':
-        'Path setup (⌘, / Ctrl+,)\nDefine path templates for shot context, plates and edits.\nUntil configured, folder discovery is off and only scene Reads are used.',
+    '설정 (⌘, / Ctrl+,)\n언어 · 샷 문맥 · 플레이트 · 편집본 폴더 구조를 경로 템플릿으로 지정합니다.\n경로 설정 전에는 공유 폴더 탐색이 꺼져 있고 씬의 Read 만 씁니다':
+        'Settings (⌘, / Ctrl+,)\nLanguage, plus path templates for shot context, plates and edits.\nUntil paths are configured, folder discovery is off and only scene Reads are used.',
     '새로고침 — 경로 설정의 편집본 / 플레이트와 씬 Read 목록을 다시 찾습니다\n(편집본 폴더를 다시 검색하므로 공유 폴더 상태에 따라 몇 초 걸릴 수 있습니다. 취소 가능)':
         'Refresh edits / plates from Path setup and the scene Read list.\nSearching edit folders may take a few seconds depending on storage. You can cancel.',
     '편집본 — 리타임 기준이 되는 컷 (mov / 시퀀스)': 'Edit — reference cut for retiming (movie / sequence)',
     '플레이트 1개 (보통의 샷)': 'One plate (standard shot)',
-    '한 화면에 소스 플레이트가 여러 개 합성된 샷 — 체크한 플레이트마다 영역을 분리해 따로 리타임합니다':
-        'Multiple source plates composited into one image — match a separate region for each checked plate.',
+    '한 화면 안에 소스 플레이트 여러 개를 나란히(좌우·상하 등) 합성한 샷 — 플레이트 사이의 컷 전환이 아닙니다. 체크한 플레이트마다 영역을 분리해 따로 리타임합니다':
+        'Several source plates composited side by side (left/right, top/bottom) in the same frame — not a cut between them. Each checked plate is isolated and retimed separately.',
     '소스 플레이트 — 리타임 TimeWarp 를 걸 대상 (경로 설정이 있으면 최신 플레이트가 기본)':
         'Source plate — input for the retime TimeWarp (latest plate by default when Path setup is configured)',
     'TimeWarp 출력(FrameRange)의 첫 프레임 번호. 기본은 PLATE 시작 프레임':
@@ -194,7 +409,7 @@ _UI_TEXT_EN = {
     '초기화 — 배제 구간 · 고정점 · 선택을 모두 지웁니다 (확인 후)': 'Reset — clear exclusions, pins and selection (after confirmation)',
     '배제 구간 / 고정점을 텍스트로 입력하거나 확인합니다\n타임라인과 양방향으로 맞춰집니다':
         'Enter or review excluded ranges / pins as text.\nChanges synchronize with the timeline in both directions.',
-    '선택 PLATE가 보이는 EDIT 영역을 드래그합니다': 'Drag the EDIT region containing the selected PLATE.',
+    '한 화면에 합성된 클립 하나가 보이는 EDIT 영역을 드래그합니다. 분할합성에서는 그 영역에 가장 잘 맞는 체크된 PLATE를 엔진이 고르며, 플레이트가 2개면 영역 하나만 그려도 나머지 화면은 다른 플레이트로 맞춥니다': 'Drag the EDIT region where one composited clip is visible. In split composite the engine picks the checked PLATE that matches that region best; with two plates one region is enough and the rest of the frame is matched to the other plate.',
     '선택 PLATE의 소스 TC 번인만 감싸도록 드래그합니다': 'Drag around only the source TC burn-in for the selected PLATE.',
     '배제할 EDIT 프레임 / 구간 (쉼표로 구분)': 'EDIT frames / ranges to exclude (comma-separated)',
     'EDIT=PLATE 대응 (쉼표로 구분)': 'EDIT=PLATE pairs (comma-separated)',
@@ -205,11 +420,19 @@ _UI_TEXT_EN = {
         'Search the configured edit folders again and select the latest edit for each shot.',
     '기본 FHD. 화면비를 유지하며 맞추고, 텍스트는 최종 출력 해상도에 그립니다.':
         'Defaults to FHD. Fits the image while preserving aspect ratio; text is drawn at the final output resolution.',
-    '폴더(또는 MOV 파일 경로 / JPEG 는 ####가 든 경로)를 지정합니다\n비워 두면 스크립트 옆 qc_review/':
-        'Choose a folder, MOV path, or JPEG path containing ####.\nLeave empty to use qc_review/ beside the script.',
+    '폴더(또는 MOV 파일 경로 / JPEG 는 ####가 든 경로)를 지정합니다\n비워 두면 스크립트 옆 retime_QC_reviews/':
+        'Choose a folder, MOV path, or JPEG path containing ####.\nLeave empty to use retime_QC_reviews/ beside the script.',
     '실행 로그 펼치기 / 접기': 'Expand / collapse the run log',
     '\n\n전체 기록은 [로그] 를 펼쳐 확인할 수 있습니다': '\n\nExpand Log to view the full record.',
     'QC 화면': 'QC view',
+    '렌더 방식': 'Render mode',
+    '지금 Nuke에서 렌더': 'Render now in Nuke',
+    'Write 노드만 만들기 (렌더팜용)': 'Create the Write node only (for a render farm)',
+    '기존 Write 설정 따르기': 'Follow existing Write settings',
+    '스크립트에 있는 Write 노드(스튜디오 설정)에서 색공간·코덱·압축·채널을 가져와 QC 리뷰 Write에 씁니다. 형식과 해상도는 위에서 고른 대로 두고 경로·프레임 범위·콜백은 따르지 않습니다. 색공간은 출력·디스플레이용(sRGB·Rec.709 등)만 따르고 log·linear 색공간은 따르지 않습니다. 끄면 NMMR 기본값을 씁니다.':
+        'Takes colorspace, codec, compression and channels from the Write nodes already in the script (studio settings) for the QC review Write. Format and resolution stay as chosen above. Paths, frame ranges and callbacks are not followed. Only output/display colorspaces (sRGB, Rec.709 and the like) are followed, never log or linear ones. Turn off to use the NMMR defaults.',
+    'Write 노드만 만들기: QC 리뷰 노드 그래프와 Write를 남기고 렌더하지 않습니다. 렌더팜에서 렌더하세요. 형식은 위에서 고른 MOV나 JPEG 그대로입니다.':
+        'Create the Write node only: keeps the QC review node graph and its Write without rendering. Render it on the farm. The format stays as chosen above (MOV or JPEG).',
     '룩 매치 + Difference (Beta)': 'Look match + Difference (Beta)',
     '단순 Difference': 'Plain Difference',
     '구조 차이 강조': 'Structure overlay',
@@ -227,18 +450,19 @@ _UI_TEXT_EN = {
     '보통': 'Regular',
     '라벨 배경(노랑)의 불투명도입니다. 100이면 완전 불투명, 0이면 배경이 사라집니다. 글자는 항상 불투명합니다.':
         'Opacity of the yellow label background. 100 is fully opaque, 0 removes the background. The text is always opaque.',
-    '굵게는 Menlo Bold(macOS) / Consolas Bold(Windows) / DejaVu Sans Mono Bold(Linux)를 씁니다. 글꼴이 없으면 보통 글꼴로 표시하고 로그에 남깁니다.':
-        'Bold uses Menlo Bold (macOS), Consolas Bold (Windows) or DejaVu Sans Mono Bold (Linux). If the font is missing, the regular font is used and the log says so.',
+    '굵게는 macOS에서 Menlo Bold, 그 밖의 시스템에서는 DejaVu Sans Mono Bold가 있으면 그것을, 없으면 Nuke에 들어 있는 Courier 10 Pitch Bold를 씁니다. 글꼴이 없으면 보통 글꼴로 표시하고 로그에 남깁니다.':
+        'Bold uses Menlo Bold on macOS. On other systems it uses DejaVu Sans Mono Bold when available, otherwise the Courier 10 Pitch Bold that ships with Nuke. If the font is missing, the regular font is used and the log says so.',
     '왼쪽에서 %': 'From left %',
     '위에서 %': 'From top %',
-    '기본: 검증된 고정 Grade로 톤을 맞춘 RGB Difference. 보정 불가 시 화면에는 DIFF만 표시합니다. 추가 로컬 렌더가 필요합니다. 구조 강조는 별도 보기이며 실제 Difference와 다릅니다.':
+    '기본: 검증된 고정 Grade로 톤을 맞춘 RGB Difference. 룩이 적용되면 화면에 DIFF / LOOK MATCH를 표시하고 보류되면 DIFF만 표시합니다. 추가 로컬 렌더가 필요합니다. 구조 강조는 별도 보기이며 실제 Difference와 다릅니다.':
         'Default: RGB Difference after a validated static Grade. The view says DIFF / LOOK MATCH when the look is applied and plain DIFF when fitting is held. Extra local renders are required. Structure overlay is a separate view, not plain Difference.',
-    '지정한 번인 TC 영역 바로 위에 표시합니다. 위쪽 여백이 없으면 아래. TC 영역 미지정 시 오른쪽 아래를 기준으로 배치하며 미지정을 표시합니다. 직접 위치는 라벨 왼쪽 위 기준입니다.':
-        'Place above the saved burn-in TC region, or below if there is no room above. Without a region, use a lower-right fallback and show that the region is not set. Custom coordinates anchor the label top left.',
+    '지정한 번인 TC 영역 바로 위에 표시합니다. 위쪽 여백이 없으면 아래. TC 영역 미지정 시 오른쪽 아래를 기준으로 배치하며 미지정을 표시합니다. 직접 위치는 라벨 왼쪽 위 기준입니다. 노드 트리의 QC Difference 아래에도 같은 라벨을 붙입니다.':
+        'Place above the saved burn-in TC region, or below if there is no room above. Without a region, use a lower-right fallback and show that the region is not set. Custom coordinates anchor the label top left. The same label is also added under the QC Difference in the node tree.',
     '항상 위': 'Always on top',
     '툴팁 표시': 'Show tooltips',
-    '선택한 Read로 설정': 'Use selected Reads',
+    '선택한 Read 불러오기': 'Load selected Reads',
     '경로 설정': 'Path setup',
+    '설정': 'Settings',
     '단일': 'Single',
     '배치': 'Batch',
     '편집본': 'Edit',
@@ -257,6 +481,12 @@ _UI_TEXT_EN = {
     '최대 배속': 'Maximum speed',
     '출력': 'Output',
     '입력 노드': 'Input nodes',
+    'Difference 배치': 'Difference placement',
+    '배치 결과 배치': 'Batch result placement',
+    '한 곳에 모음': 'Gather in one place',
+    '플레이트 근처': 'Near the plates',
+    'B 파이프 (Difference가 플레이트 열 안)': 'B pipe (Difference in the plate column)',
+    '옆 가지 (분기 Dot + 옆 QC 칸)': 'Side branch (branch Dot + side QC column)',
     '새 Read (같은 파일·색공간·범위)': 'New Read (same file, colorspace, range)',
     'PostageStamp (원본 참조)': 'PostageStamp (source reference)',
     ('결과 백드롭 안에 둘 입력 노드\n'
@@ -289,7 +519,7 @@ _UI_TEXT_EN = {
     '테스트': 'Test',
     '저장': 'Save',
     '이 값 쓰기': 'Use this value',
-    '경로 설정 — No More Manual Retime': 'Path setup — No More Manual Retime',
+    '설정 — No More Manual Retime': 'Settings — No More Manual Retime',
     '쉬운 설정': 'Easy setup',
     '개발자 모드': 'Developer mode',
     '토큰 넣기': 'Insert token',
@@ -381,8 +611,8 @@ _UI_TEXT_EN = {
     '삭제된 PLATE Read': 'Deleted PLATE Read',
     '배치는 중간 확인 팝업이 없습니다. 켜면 오래 걸릴 샷을 건너뛰고, 끄면 그대로 진행합니다':
         'Batch has no mid-run confirmation. Enable this to skip long shots, or disable it to continue.',
-    '편집본에서 번인 TC 영역(ROI)을 지정하고 클립 전체로 판독을 테스트합니다\n(쇼 / 프로젝트당 한 번, 배치도 자동 사용)':
-        'Set the burn-in TC region (ROI) and test recognition across the clip. Saved calibration is reused by batch.',
+    '편집본에서 번인 TC 영역(ROI)을 지정하고 클립 전체로 판독을 테스트합니다\n(프로젝트당 한 번. 배치도 자동으로 씁니다)':
+        'Set the burn-in TC region (ROI) on an edit and test recognition across the clip.\n(Once per project. Batch uses it automatically.)',
     '임시 저장소의 상위 폴더를 고릅니다': 'Choose the parent folder for temporary storage.',
     '운영체제의 기본 임시 폴더로 되돌립니다': 'Return to the operating system default temporary folder.',
     '현재 no_more_manual_retime 임시 폴더를 Finder/탐색기에서 엽니다. 작업 중인 파일은 지우지 마세요':
@@ -391,8 +621,8 @@ _UI_TEXT_EN = {
         'Open the persistent ROI mask folder in Finder/Explorer.',
     '분할합성 ROI 마스크의 영구 로컬 경로입니다. 저장된 스크립트가 참조하므로 자동 삭제하지 않습니다.\n경로는 선택해 복사할 수 있으며, 직접 지우면 해당 Read가 깨질 수 있습니다.':
         'Permanent local path for split-composite ROI masks. Saved scripts may reference these files, so they are not deleted automatically.\nThe path is selectable for copying; deleting a mask can break its Read node.',
-    '저장 위치 — 비우면 .nk 옆 qc_review/ 폴더에 자동 이름':
-        'Output location — leave empty for an automatic name under qc_review/ beside the .nk file',
+    '저장 위치 — 비우면 .nk 옆 retime_QC_reviews/ 폴더에 자동 이름':
+        'Output location — leave empty for an automatic name under retime_QC_reviews/ beside the .nk file',
     '저장 폴더 고르기': 'Choose output folder',
     '저장된 QC 리뷰 파일을 Finder(탐색기)에서 선택해 보여줍니다 (재생기는 열지 않음)':
         'Reveal the saved QC review file in Finder/Explorer without opening a player.',
@@ -442,7 +672,7 @@ _UI_TEXT_EN.update({
     'flop 검사': 'Check flop',
     '슬로우(보간) 감지': 'Detect slow motion (interpolation)',
     '작업 후 썸네일 캐시 삭제': 'Delete thumbnail cache after the job',
-    'QC 트리 생성': 'Create QC tree',
+    'QC 노드 세트 생성': 'Create QC node set',
     'QC 룩 매치 (Beta)': 'QC look match (Beta)',
     '2차 QC 검사 (Beta)': 'Secondary QC check (Beta)',
     '리프레임 출력 (Beta)': 'Reframe output (Beta)',
@@ -468,8 +698,8 @@ _UI_TEXT_EN.update({
     '새로고침 — 경로 설정의 편집본 / 플레이트와 씬 Read 목록을 다시 찾습니다\n(편집본 폴더를 다시 검색하므로 공유 폴더 상태에 따라 몇 초 걸릴 수 있습니다. 취소 가능)':
         'Refresh configured edits/plates and scene Reads. Rescanning the edit folder can take a few seconds and may be cancelled.',
     '플레이트 1개 (보통의 샷)': 'One plate (standard shot)',
-    '한 화면에 소스 플레이트가 여러 개 합성된 샷 — 체크한 플레이트마다 영역을 분리해 따로 리타임합니다':
-        'A shot combining several source plates — each checked plate is isolated and retimed separately.',
+    '한 화면 안에 소스 플레이트 여러 개를 나란히(좌우·상하 등) 합성한 샷 — 플레이트 사이의 컷 전환이 아닙니다. 체크한 플레이트마다 영역을 분리해 따로 리타임합니다':
+        'Several source plates composited side by side (left/right, top/bottom) in the same frame — not a cut between them. Each checked plate is isolated and retimed separately.',
     'TimeWarp 출력(FrameRange)의 첫 프레임 번호. 기본은 PLATE 시작 프레임':
         'First frame of the TimeWarp output (FrameRange). The default is the PLATE start frame.',
     '처음 프레임  (Home · Shift+Home = 처음까지 구간 확장)': 'First frame (Home · Shift+Home extends selection to start)',
@@ -484,7 +714,7 @@ _UI_TEXT_EN.update({
     '배제 해제 — 선택 구간의 배제를 풉니다': 'Restore the selected excluded range.',
     '현재 프레임에 고정점 지정 — 대응하는 PLATE 프레임을 입력하면\n매칭 경로가 반드시 그 대응을 지납니다':
         'Add a pin at the current frame. Enter the corresponding PLATE frame to force the matching path through it.',
-    '선택 PLATE가 보이는 EDIT 영역을 드래그합니다': 'Drag the EDIT region showing the selected PLATE.',
+    '한 화면에 합성된 클립 하나가 보이는 EDIT 영역을 드래그합니다. 분할합성에서는 그 영역에 가장 잘 맞는 체크된 PLATE를 엔진이 고르며, 플레이트가 2개면 영역 하나만 그려도 나머지 화면은 다른 플레이트로 맞춥니다': 'Drag the EDIT region where one composited clip is visible. In split composite the engine picks the checked PLATE that matches that region best; with two plates one region is enough and the rest of the frame is matched to the other plate.',
     '선택 PLATE의 소스 TC 번인만 감싸도록 드래그합니다': 'Drag around only the source-TC burn-in for the selected PLATE.',
     '초기화 — 배제 구간 · 고정점 · 선택을 모두 지웁니다 (확인 후)': 'Reset exclusions, pins, and selection after confirmation.',
     '배제 구간 / 고정점을 텍스트로 입력하거나 확인합니다\n타임라인과 양방향으로 맞춰집니다':
@@ -493,13 +723,13 @@ _UI_TEXT_EN.update({
     'EDIT=PLATE 대응 (쉼표로 구분)': 'EDIT=PLATE mappings (comma-separated)',
     '노드그래프에서 지금 선택한 Read 를 이 창의 EDIT / PLATE 입력으로 지정합니다. 창을 연 뒤 선택을 바꿨을 때 누릅니다.\n· MP 1개 → 그 샷 기준 (경로 설정이 있으면 최신 편집본 자동)\n· MP + 편집본 mov → 둘 다 그대로\n· MP 여러 개, 같은 샷 → 분할합성\n· MP 여러 개, 다른 샷 → 배치 탭':
         'Assign the Reads currently selected in the Node Graph as the EDIT / PLATE inputs of this window. Press this after changing the selection with the window open.\n· One plate → use that shot (latest edit when paths are configured)\n· Plate + edit MOV → use both\n· Multiple plates, same shot → split composite\n· Multiple plates, different shots → Batch tab',
-    '경로 설정 (⌘, / Ctrl+,)\n샷 문맥 · 플레이트 · 편집본 폴더 구조를 경로 템플릿으로 지정합니다.\n설정 전에는 공유 폴더 탐색이 꺼져 있고 씬의 Read 만 씁니다':
-        'Path setup (⌘, / Ctrl+,)\nDescribe the shot context, plate, and edit folders with path templates. Until configured, automatic folder search is off and only scene Reads are used.',
+    '설정 (⌘, / Ctrl+,)\n언어 · 샷 문맥 · 플레이트 · 편집본 폴더 구조를 경로 템플릿으로 지정합니다.\n경로 설정 전에는 공유 폴더 탐색이 꺼져 있고 씬의 Read 만 씁니다':
+        'Settings (⌘, / Ctrl+,)\nLanguage, plus path templates for the shot context, plate, and edit folders. Until paths are configured, automatic folder search is off and only scene Reads are used.',
     '노드그래프에서 선택한 MP(시퀀스) Read 를 행으로 추가합니다\n같이 선택한 편집본 mov 는 샷코드로 짝지어 자동 최신 대신 사용합니다':
         'Add selected plate-sequence Reads as rows. A selected edit MOV is paired by shot code instead of using the automatically found latest edit.',
     '표에서 선택한 행을 목록에서 뺍니다 (노드는 지우지 않습니다)': 'Remove selected table rows without deleting nodes.',
     '경로 설정의 편집본 폴더를 다시 검색해 샷별 최신 편집본을 다시 고릅니다': 'Rescan configured edit folders and choose the latest edit for each shot.',
-    '편집본에 번인된 소스 TC 를 읽습니다 (TC 우선 모드)\n확신한 TC 가 충분하고(30% 이상) 플레이트 범위에 맞으면(80% 이상) 고정점으로 쓰고,\n이미지 매칭과 크게 어긋나는 TC 는 버립니다. 조건 미달이면 이미지 매칭이 주가 됩니다.\n배제 구간도 TC 로 정확한 정수 리타임이 됩니다':
+    '편집본에 번인된 소스 TC 를 읽습니다 (자동 모드)\n확신한 TC 가 충분하고(30% 이상) 플레이트 범위에 맞으면(80% 이상) 고정점으로 쓰고,\n이미지 매칭과 크게 어긋나는 TC 는 버립니다. 조건 미달이면 이미지 매칭이 주가 됩니다.\n배제 구간도 TC 로 정확한 정수 리타임이 됩니다':
         'Read source TC burned into the edit. Confident TC is used as pins when coverage is at least 30% and at least 80% falls inside the plate range. TC that strongly disagrees with image matching is rejected; otherwise image matching remains primary. TC can also resolve excluded ranges to integer frames.',
     '편집본이 플레이트를 리사이즈 / 리포지션했는지 추정합니다 (스케일 0.8~1.6, 이동).\n끄면 무보정 그대로 비교합니다':
         'Estimate edit resize/reposition relative to the plate (scale 0.8–1.6 and translation). Disable to compare without correction.',
@@ -510,12 +740,12 @@ _UI_TEXT_EN.update({
         'When interpolated slow motion is detected, create fractional TimeWarp lookup keys only for that range. Integer-frame edits stay on integer lookups.',
     '작업이 끝나면 이번 실행에서 만든 썸네일 캐시를 지웁니다.\n끄면 남겨 두고 재실행할 때 재사용합니다 (7일 지난 캐시는 항상 자동 정리)':
         'Delete thumbnail caches created by this run when it finishes. Disable to reuse them on the next run; caches older than seven days are always cleaned.',
-    'EDIT 와 리타임 결과를 겹쳐 보는 difference QC 트리를 만듭니다': 'Create a Difference QC tree comparing EDIT with the retimed result.',
+    'EDIT 와 리타임 결과를 겹쳐 보는 difference QC 노드 세트를 만듭니다': 'Create a Difference QC node set comparing EDIT with the retimed result.',
     'Beta · 기본 켬. 신뢰 프레임에서 한 샷의 고정 Grade를 추정하고 별도 프레임으로 검증합니다.\n검증을 통과하면 출력 트리 끝(Transform 뒤)에 켜진 Grade를 붙이고 QC Difference도 그 뒤를 비교합니다. 이 Grade는 QC Difference를 더 또렷하게 보기 위한 룩 매치이며 편집본 룩으로 출력하려는 것이 아닙니다. 원본 톤으로 렌더하려면 Grade를 disable 하세요.\n로컬 추가 렌더로 시간이 늘어나며 분할합성·영역 분석·근거 부족이면 보류합니다. 프레임 정확도 검증을 대체하지 않습니다.':
         'Beta · On by default. Estimate one static Grade from trusted frames and validate it on separate frames. When it passes, an enabled Grade is added at the end of the output tree (after the Transform) and QC Difference compares after it. This Grade is a look match that makes the QC Difference easier to read, not a way to output the plate in the edit look. Disable the Grade to render the original plate tone. It adds local renders and is held for split composites, region analysis, or weak evidence. It does not replace frame-accuracy review.',
     'Beta · 기본 꺼짐. 최종 QC Difference의 두 입력을 모든 출력 프레임에서 다시 렌더해 밝기 차이를 수치로 검사합니다.\n기존 알파와 매칭 마스크를 적용하고 이상 프레임을 표시합니다. 정지·저동작 구간은 판정 제한으로 남깁니다.\n리타임 곡선은 바꾸지 않으며 프레임 정확도 검증을 대체하지 않습니다. 로컬 추가 렌더만 사용합니다.':
         'Beta · Off by default. Re-render both final QC Difference inputs across all output frames and measure brightness residuals. Existing alpha and matching masks are applied and suspect frames are marked; static or low-motion ranges remain limited. It never changes the retime curve or replaces frame-accuracy review, and uses local renders only.',
-    '고급 베타 기능. 검증된 옵티컬 결과를 EDIT 포맷 width-fit 기준의 별도 Transform 으로 출력합니다.\n가변 리프레임은 프레임별 scale/translate 키, 고정 리프레임은 정적 scale/translate 값을 만듭니다.\nQC 가 꺼져 있어도 결과 Transform 을 만들며, QC 가 켜져 있으면 같은 Transform 을 재사용합니다.\nQC 위치 정밀화를 켜면 QC 트리 생성 여부와 관계없이 검증된 정적 보정값을 반영합니다.\n옵티컬 감지가 꺼졌거나 분할합성 모드이면 출력을 보류합니다. 추적을 끄면 정적 Transform 만 만듭니다.':
+    '고급 베타 기능. 검증된 옵티컬 결과를 EDIT 포맷 width-fit 기준의 별도 Transform 으로 출력합니다.\n가변 리프레임은 프레임별 scale/translate 키, 고정 리프레임은 정적 scale/translate 값을 만듭니다.\nQC 가 꺼져 있어도 결과 Transform 을 만들며, QC 가 켜져 있으면 같은 Transform 을 재사용합니다.\nQC 위치 정밀화를 켜면 QC 노드 세트 생성 여부와 관계없이 검증된 정적 보정값을 반영합니다.\n옵티컬 감지가 꺼졌거나 분할합성 모드이면 출력을 보류합니다. 추적을 끄면 정적 Transform 만 만듭니다.':
         'Advanced Beta. Output validated optical results as a separate Transform in EDIT-format width-fit space. Variable reframing creates per-frame scale/translate keys; fixed reframing creates static values. The result Transform is created even when QC is off and reused when QC is on. High-resolution QC refinement contributes validated static correction. Output is held when optical detection is off or split-composite mode is active; disabling tracking creates only a static Transform.',
     '고정 리프레임에만 최대 8개 앵커를 512px로 추가 렌더해 위치·배율 보정. 처리 시간이 늘어납니다. 가변 리프레임은 기존 추적을 유지합니다.':
         'For fixed reframing only, render up to eight 512 px anchors to refine position and scale. This increases processing time. Variable reframing keeps its existing track.',
@@ -525,16 +755,16 @@ _UI_TEXT_EN.update({
         'Append QC views for all results (all plates in Single; completed shots in Batch) and render once. This is an off-by-default overview for many shots. The QC view combines a darkened edit with structural Difference edges between edit and retime.',
     "리타임이 고른 메인플레이트 프레임의 TC 를 모든 프레임에 노랑 'MP' 라벨로 표시합니다\n편집본 번인(TC / 로고)과 겹치지 않는 모서리를 자동으로 고릅니다. TC 메타가 없으면 프레임 번호":
         "Show the selected main-plate TC on every frame with a yellow 'MP' label. A corner avoiding edit burn-ins is chosen automatically; frame numbers are used when TC metadata is unavailable.",
-    '폴더(또는 MOV 파일 경로 / JPEG 는 ####가 든 경로)를 지정합니다\n비워 두면 스크립트 옆 qc_review/':
-        'Choose a folder, MOV path, or JPEG path containing ####. Leave empty to use qc_review/ beside the script.',
+    '폴더(또는 MOV 파일 경로 / JPEG 는 ####가 든 경로)를 지정합니다\n비워 두면 스크립트 옆 retime_QC_reviews/':
+        'Choose a folder, MOV path, or JPEG path containing ####. Leave empty to use retime_QC_reviews/ beside the script.',
     '분석 썸네일과 QC 임시 샘플을 선택한 폴더 아래 no_more_manual_retime/에만 만듭니다.\n원본과 서버 미디어는 읽기만 하며 수정·이름 변경·삭제하지 않습니다. 실행 중에는 이 경로가 고정됩니다.\n작업 종료 때 사용한 캐시를 정리하고, 남은 파일은 [열기]로 확인해 작업이 없을 때 직접 지울 수 있습니다.\n분할합성 ROI 마스크는 아래에 표시된 영구 폴더에 따로 보존되며 임시 캐시 정리에서 제외됩니다.\n저장된 .nk 옆의 명시적 QC 리뷰도 임시 캐시가 아니며 이 설정으로 옮기지 않습니다.':
         'Analysis thumbnails and temporary QC samples are created only under no_more_manual_retime/ in the selected folder. Source and server media are read-only and are never modified, renamed, or deleted; the path is fixed while a job runs. Used caches are cleaned at job end, and remaining files may be reviewed with Open and removed manually while no job is running. Split-composite ROI masks are preserved separately in the persistent folder shown below and excluded from temporary-cache cleanup. Explicit QC reviews saved beside the .nk are not temporary caches and are not moved by this setting.',
     'PLATE 영역 자동 · TC 영역 전역 보정 · 사전검사 전': 'PLATE region automatic · TC region global calibration · Preflight not run',
     '영역 지정됨 · 테스트 100%': 'Region set · Test 100%',
     '전체 기록은 [로그] 를 펼쳐 확인할 수 있습니다': 'Expand Log to see the full record.',
     '옵션 기본값 사용': 'Using default options',
-    '기준: 스크립트\n스크립트 경로가 샷 문맥 템플릿에 맞지 않아 서버 자동 소스(최신 편집본 / 플레이트)가 없습니다.\n[경로 설정] 의 [현재 스크립트로 테스트] 로 어디서 멈췄는지 볼 수 있습니다.\n씬의 Read 는 그대로 고를 수 있습니다.\n\n노드그래프에서 MP Read 를 선택하고 [선택한 Read로 설정]를 누르면\n그 샷 기준으로 다시 찾습니다':
-        'Context: script\nThe script path does not match a shot-context template, so no automatic source was found. Use Test with current script in Path setup to see where resolution stopped. Scene Reads remain available.\n\nSelect a plate Read in the Node Graph and click Use selected Reads to search again using that shot context.',
+    '기준: 스크립트\n스크립트 경로가 샷 문맥 템플릿에 맞지 않아 서버 자동 소스(최신 편집본 / 플레이트)가 없습니다.\n[경로 설정] 의 [현재 스크립트로 테스트] 로 어디서 멈췄는지 볼 수 있습니다.\n씬의 Read 는 그대로 고를 수 있습니다.\n\n노드그래프에서 MP Read 를 선택하고 [선택한 Read 불러오기]를 누르면\n그 샷 기준으로 다시 찾습니다':
+        'Context: script\nThe script path does not match a shot-context template, so no automatic source was found. Use Test with current script in Path setup to see where resolution stopped. Scene Reads remain available.\n\nSelect a plate Read in the Node Graph and click Load selected Reads to search again using that shot context.',
 })
 
 _UI_TEXT_EN.update({
@@ -714,11 +944,27 @@ def _visible_ui_text(text):
     return reverse.get(text, reverse.get(_english_ui_text(text), text))
 
 
+# Reasons that follow 'Failed — ' / 'Skipped — ' in a stored status. They are written in the language that was active
+# when the row ran, so the display translates both ways and a language switch never leaves mixed text.
+_BATCH_DETAIL_PAIRS = (
+    ('사용자 취소', 'Cancelled by user'),
+    ('취소', 'Cancelled'),
+    ('PLATE Read 삭제됨', 'PLATE Read deleted'),
+    ('선택한 EDIT Read가 삭제됨', 'Selected EDIT Read was deleted'),
+    ('렌더 예상 시간 초과로 건너뜀', 'Skipped because the estimated render time exceeds the limit'),
+)
+_BATCH_STATUS_HEADS = (('실패 — ', 'Failed — '), ('건너뜀 — ', 'Skipped — '))
+
+
 def batch_display_status(status):
     """Localize authored batch copy without changing the stored state or error data."""
     text = str(status or '')
     if ui_language() != 'en':
-        return text
+        for ko, en in _BATCH_STATUS_HEADS:
+            if text.startswith(en):
+                detail = text[len(en):]
+                return ko + dict((e, k) for k, e in _BATCH_DETAIL_PAIRS).get(detail, detail)
+        return '건너뜀' if text == 'Skipped' else text
     exact = {
         '대기': 'Waiting', '진행 중': 'In progress', '취소': 'Cancelled',
         '경로 설정 없음': 'Path setup not configured',
@@ -731,10 +977,12 @@ def batch_display_status(status):
     }
     if text in exact:
         return exact[text]
-    for ko, en in (('실패 — ', 'Failed — '), ('건너뜀 — ', 'Skipped — '),
-                   ('편집본 찾기 중단 (', 'Edit search stopped (')):
+    for ko, en in _BATCH_STATUS_HEADS:
         if text.startswith(ko):
-            return en + text[len(ko):]
+            detail = text[len(ko):]
+            return en + dict(_BATCH_DETAIL_PAIRS).get(detail, detail)
+    if text.startswith('편집본 찾기 중단 ('):
+        return 'Edit search stopped (' + text[len('편집본 찾기 중단 ('):]
     if text == '건너뜀':
         return 'Skipped'
     if text.startswith('완료'):
@@ -751,20 +999,25 @@ def batch_display_status(status):
                        ('정지 구간 근거 부족 OUT ', 'Insufficient hold evidence OUT '),
                        ('정지 구간 근거 약함 ', 'Weak hold evidence: '),
                        ('정지 TC 확정', 'Hold confirmed by TC'), ('정지 고정점 확정', 'Hold confirmed by pins'),
-                       ('(확인 필요)', '(review required)'), ('(좋음)', '(Good)'), ('(보통)', '(Fair)'), ('(낮음)', '(Low)')):
+                       ('(확인 필요)', '(review required)'), ('(좋음)', '(Good)'), ('(보통)', '(Fair)'), ('(낮음)', '(Low)'),
+                       ('TC만 · ', 'TC only · '), ('검토: ', 'Review: '),
+                       ('2차 QC 확인', 'Secondary QC review'), ('2차 QC 판정 제한', 'Secondary QC limited'),
+                       ('2차 QC 검사 실패', 'Secondary QC failed'), ('2차 QC 잔차 낮음', 'Secondary QC residual low')) + \
+                      tuple(sorted(_RESULT_REASON_EN.items(), key=lambda kv: -len(kv[0]))):
             text = text.replace(ko, en)
+        text = re.sub(r' · 보간 (\d+)', r' · \1 interpolated', text)
         text = re.sub(r'TC 오프셋 ([+-]?\d+) 의심 · 미사용', r'Possible TC offset \1 · unused', text)
         text = re.sub(r'TC 대조 일치 (\d+)/(\d+)프레임', r'TC check matched \1/\2 frames', text)
         text = text.replace('프레임 정확도: TC 미채택, QC로 확인', 'Frame accuracy: TC not adopted, check QC')
         text = text.replace('프레임 정확도: 번인 TC 없음, QC로 확인', 'Frame accuracy: no burn-in TC, check QC')
         text = re.sub(r' 외 (\d+)구간', r' +\1 ranges', text)
         text = re.sub(r' 외 (\d+)', r' +\1 more', text)
-        text = re.sub(r'확인 (\d+)프레임', r'Review \1 frames', text)
+        text = re.sub(r'확인 (\d+)프레임', lambda m: 'Review %s frame%s' % (m.group(1), '' if m.group(1) == '1' else 's'), text)
         text = re.sub(r'(?:모호 프레임|품질 낮은 프레임|상하 절반 합의) \d+%|'
                       r'스케일 범위 밖\(필러/레터박스 의심, 탐색 [\d.]+~[\d.]+\)|'
                       r'시간-이동 모호\(플레이트 팬/틸트 \+ 리포지션 이동 애니메이션 — 경로 확인 권장\)',
                       lambda match: _report_detail_text(match.group(0)), text)
-    return text
+    return _singular(text)
 
 
 def _retime_unavailable_text(reason):
@@ -775,8 +1028,8 @@ def _retime_unavailable_text(reason):
         'Nuke 밖에서는 확인할 수 없습니다': 'Cannot check outside Nuke',
         'NukeX 라이선스가 아니라 Kronos 를 설정할 수 없습니다 (노드는 생기지만 knob 이 읽기 전용).\n'
         '같은 움직임 보간은 OFlow 로 고르세요 — 이 라이선스에서 두 결과가 같습니다':
-        'Kronos cannot be configured without a NukeX licence (its knobs are read-only).\n'
-        'Choose OFlow for motion interpolation; both produce the same result with this licence.',
+        'Kronos cannot be configured without a NukeX license (the node can be created, but its knobs are read-only).\n'
+        'Choose OFlow for the same motion interpolation; both produce the same result with this license.',
     }
     if reason in fixed:
         return fixed[reason]
@@ -1134,8 +1387,8 @@ def _console(text):
         print('[No More Manual Retime] ' + str(text))
 
 
-NMMR_VERSION = '1.0.2'
-NMMR_RELEASE_VERSION = '1.0.2'
+NMMR_VERSION = '1.1.0'
+NMMR_RELEASE_VERSION = '1.1.0'
 NMMR_DISPLAY_VERSION = NMMR_RELEASE_VERSION
 
 NODE_PREFIX = 'NMMR_'
@@ -1207,6 +1460,7 @@ OPT_RETRY_HALF = 0.15  # optical re-search acceptance (when costs are equal): mi
 OPT_RETRY_STRONG = 0.7  # optical re-search acceptance: if the median cost is at most this multiple, accept regardless of top/bottom agreement (0.106 -> 0.053, agreement 92 -> 70 %)
 OPT_RETRY_GAIN = 0.9  # optical re-search acceptance: when the median path cost is at most this multiple
 TRACK_DEV_GAP = 0.15  # reject if the animation NCC of those frames is lower than the median of the other frames by more than this (zoom -0.02~0.11, cuts 0.27~0.63)
+# near-hold (still) segments - decision record
 NH_PIX = 0.40  # plate neighbor-frame picture difference (display mean absolute difference, %) at or below this = nearly identical on screen (one 8-bit step ~0.39 %)
 NH_MARGIN = 0.25  # matching-cost difference between the path frame and a neighbor frame / path frame matching cost at or below this = weak image evidence
 NH_K = 8  # maximum distance (frames) used to measure the uncertainty width
@@ -1239,6 +1493,39 @@ LOWQ_RATIO = 2.5  # matching quality warning threshold (relative to the median)
 TC_HINT_W = 1.5  # lagging TC hint weight (in noise-floor units of correct matches, for a one-frame offset)
 TC_FIRST_COV = 0.30  # TC-first mode: confident TC frames are at least this fraction of EDIT
 TC_FIRST_INRANGE = 0.80  # TC-first mode: minimum fraction of confident TCs that fall inside the plate range [first, last]
+TC_MODE_PRIORITY = 'priority'  # burn-in TC option: image matching with TC as anchors (default)
+TC_MODE_ONLY = 'only'  # burn-in TC option: timing straight from burn-in TC, no image matching for timing
+TC_ONLY_MAX_GAP = 3  # TC only: longest run of unread frames filled by linear interpolation between consistent reads
+TC_ONLY_SPIKE_MIN = 3  # TC only: an isolated read this many frames off its neighbours' line is an inconsistent read
+TC_MODE_CHOICES = ((TC_MODE_PRIORITY, '자동 (이미지 + TC)'), (TC_MODE_ONLY, 'TC만 (이미지 검증 없음)'))
+TC_MODE_TIP = ('자동 (기본): 이미지 매칭이 기본이고 번인 TC를 확신할 때만 고정점으로 보탭니다. 이미지와 크게 어긋나는 TC는 버립니다.\n'
+               'TC만: 읽은 TC만 따릅니다. 이미지는 리프레임·일치도·QC에만 쓰고 타이밍은 바꾸지 않습니다. '
+               '플레이트에 TC가 없거나 판독 실패가 %d프레임을 넘으면 그 샷은 만들지 않습니다.\n'
+               '읽지 못한 %d프레임 이하 구간은 앞뒤 TC로 채우고 Report에 표시합니다. '
+               '보간 슬로우(프레임 사이 값)는 표현하지 못합니다. 정지와 역재생은 그대로 됩니다.\n'
+               '이미지 매칭을 건너뛰어 빠릅니다. 합성 번인 기준으로 받아들인 83조건의 분석 시간 합이 자동 모드의 약 절반이었습니다(539.8초 대 1,194.3초). '
+               '정지 화면이나 암전처럼 이미지로 프레임을 가리기 어려운 구간도 번인 TC만 읽히면 그 TC로 플레이트 프레임을 정합니다.\n'
+               'TC만은 TC끼리 맞춘 결과라 독립적인 프레임 정확도가 아닙니다. QC로 확인해 주세요.') % (TC_ONLY_MAX_GAP, TC_ONLY_MAX_GAP)
+QC_TC_GROUP_TIP = ('QC 노드 세트의 Difference 아래에 붙는 플레이트 TC 라벨(MP) 노드를 Group 하나로 묶습니다.\n'
+                   '끄면(기본) 노드를 그대로 펼쳐 둡니다. NMMR_timewarp 는 어느 쪽이든 그대로 보입니다.')
+_UI_TEXT_EN.update({
+    'QC 플레이트 TC 라벨 노드 묶기': 'Group QC plate TC label nodes',
+    QC_TC_GROUP_TIP: ('Wrap the plate TC label (MP) nodes under the QC Difference in one Group.\n'
+                      'Off (default) keeps them as separate nodes. NMMR_timewarp stays visible either way.'),
+    '자동 (이미지 + TC)': 'Auto (image + TC)',
+    'TC만 (이미지 검증 없음)': 'TC only (no image check)',
+    '번인 TC 모드': 'Burn-in TC mode',
+    TC_MODE_TIP: ('Auto (default): image matching leads. Burn-in TC is added as anchors only when it is confident; '
+                  'TC that strongly disagrees with the image is dropped.\n'
+                  'TC only: follows the TC it read and nothing else. The image is used only for reframe, similarity and QC '
+                  'and never changes timing. A shot is not created if the plate has no TC or more than %d frames cannot be read.\n'
+                  'Unread gaps of %d frames or less are filled from neighboring TC and listed in the Report. '
+                  'Interpolated slow motion (in-between frames) cannot be represented. Holds and reverse work.\n'
+                  'It skips image matching so it is faster. On synthetic burn-ins the 83 accepted conditions took about half the analysis time of Auto (539.8 s vs 1,194.3 s). '
+                  'In stretches where the image is hard to match such as a still frame or a black screen the plate frame still comes from the burn-in TC as long as it can be read.\n'
+                  'This follows TC alone, so it is not an independent frame-accuracy check. Review it in QC.') % (
+                      TC_ONLY_MAX_GAP, TC_ONLY_MAX_GAP),
+})
 TC_VETO = 0.5  # image veto: if the image minimum is unique and the TC frame cost is worse than this fraction of the row separation (row median - minimum)
                       # that TC is discarded. Synthetic measurements: unrelated picture ~ 1.0, one-frame offset 0.37~0.49, two frames 0.8 (same with or without grain.
                       # noise-floor units are unusable because with grain even an unrelated picture collapses to 0.9)
@@ -1822,6 +2109,66 @@ def plate_analysis_inputs(full_edit, cropped_edit, active_box, roi_rect):
     if roi_rect is not None:
         return full_edit, manual_roi_mask(full_edit.shape[1:], roi_rect), None
     return cropped_edit, None, active_box
+
+
+# Split composite with drawn regions: the user draws the part of the EDIT frame that belongs to one clip
+# the engine decides which checked plate that part comes from. The plate a region was drawn on is only
+# the starting guess.
+SPLIT_ROI_MARGIN = 0.03  # keep the drawn plate unless the best assignment is this much better (total score)
+
+
+def split_roi_parts(regions, plate_ids):
+    """Drawn content regions -> parts [dict(key, rect, invert, drawn_on)] in plate order.
+    With exactly one drawn region and two plates, the rest of the frame is the second part."""
+    parts = []
+    for pid in plate_ids:
+        if pid in (regions or {}):
+            parts.append(dict(key='roi%d' % (len(parts) + 1), rect=normalize_manual_roi(regions[pid]),
+                              invert=False, drawn_on=pid))
+    if len(parts) == 1 and len(plate_ids) == 2:
+        parts.append(dict(key='rest', rect=parts[0]['rect'], invert=True, drawn_on=None))
+    return parts
+
+
+def split_part_mask(shape, part):
+    """Boolean EDIT mask of one part (the drawn rectangle, or everything outside it)."""
+    mask = manual_roi_mask(shape, part['rect'])
+    return ~mask if part.get('invert') else mask
+
+
+def split_roi_score(res):
+    """Lower is better: median match cost, doubled when every frame is ambiguous (wrong source)."""
+    conf = res.get('confidence') or {}
+    return float(res.get('quality', 1.0)) * (1.0 + float(conf.get('amb') or 0.0))
+
+
+def assign_split_parts(scores, parts, plate_ids, margin=SPLIT_ROI_MARGIN):
+    """One different plate per part with the lowest total score.
+    scores: {(part key, plate id): score}. The drawn assignment (each region on the plate it was drawn on,
+    the rest on the remaining plate) is kept unless the best one is better by more than `margin`.
+    Returns ({part key: plate id}, drawn_kept)."""
+    import itertools
+    keys = [p['key'] for p in parts]
+    if not keys or len(plate_ids) < len(keys):
+        return {}, True
+
+    def total(assign):
+        return sum(scores.get((k, assign[k]), float('inf')) for k in keys)
+
+    best = None
+    for perm in itertools.permutations(plate_ids, len(keys)):
+        assign = dict(zip(keys, perm))
+        if best is None or total(assign) < total(best):
+            best = assign
+    drawn = dict((p['key'], p['drawn_on']) for p in parts if p['drawn_on'] is not None)
+    left = [pid for pid in plate_ids if pid not in drawn.values()]
+    for p in parts:
+        if p['drawn_on'] is None and left:
+            drawn[p['key']] = left.pop(0)
+    if len(drawn) == len(keys) and len(set(drawn.values())) == len(keys) and \
+            total(drawn) <= total(best) * (1.0 + margin):
+        return drawn, True
+    return best, False
 
 
 def node_stable_name(node):
@@ -4219,6 +4566,165 @@ def _where(region):
     h = '좌측' if cx < 0.4 else ('우측' if cx > 0.6 else '')
     v = '상단' if cy < 0.4 else ('하단' if cy > 0.6 else '')
     return (v + ' ' + h).strip() or '중앙'
+
+
+# Spatial (split-screen) composite: one EDIT frame built from two plates side by side or top/bottom.
+# Only the part that comes from this plate follows this plate's timing; the other part never matches it.
+COMP_HALF_AGREE = 0.8  # own half: independent matching agrees with the path on at least this fraction
+COMP_HALF_OTHER = 0.35  # other half: agrees on at most this fraction (its content is not from this plate)
+COMP_RESID_RATIO = 1.5  # other half residual at the path frame / own half residual
+COMP_EXCESS_SHARE = 0.8  # mismatch run: share of the excess residual that must sit in ...
+COMP_EXCESS_AREA = 0.5  # ... at most this fraction of the analysed area
+COMP_REST_RATIO = 1.35  # mismatch run: residual of the rest of the frame vs its level outside the run
+
+
+def composite_halves(E_lum, P_lum, m, path, E_valid, opt=None, coords=None, win=30, nmax=40):
+    """Split-screen check by halves (top/bottom and left/right).
+    Each half is matched on its own against the plate frames around the path. In a two-plate spatial
+    composite the half from this plate keeps agreeing with the path while the other half votes for
+    unrelated frames and keeps a clearly higher residual. A static half of a normal shot also votes
+    randomly but matches at a low residual, so it is not taken as a composite.
+    Returns dict(where, frac, mask, agree, ratio) for the half NOT explained by this plate, or None."""
+    E, He, We = E_lum.shape
+    P, Hp, Wp = P_lum.shape
+    yy, xx = np.nonzero(m)
+    vt = np.where(E_valid)[0]
+    if len(yy) < 64 or len(vt) < 8:
+        return None
+    Y, X = np.arange(He)[:, None], np.arange(We)[None, :]
+    cy, cx = float(np.median(yy)), float(np.median(xx))
+    parts = [(m & (Y < cy), m & (Y >= cy)), (m & (X < cx), m & (X >= cx))]
+    Pb = blur121(P_lum)
+    xy0 = None if coords is not None else warp_coords(He, We, Hp, Wp, opt['s'], opt['tx'], opt['ty'], opt['flop'])
+    sel = vt[np.linspace(0, len(vt) - 1, min(nmax, len(vt))).astype(int)]
+    best = None
+    for halves in parts:
+        if min(h.sum() for h in halves) < 0.2 * m.sum():
+            continue
+        cells = [_cells(h) for h in halves]
+        votes, resid = [[], []], [[], []]
+        for t in sel:
+            lo, hi = max(0, int(path[t]) - win), min(P - 1, int(path[t]) + win)
+            idx = np.arange(lo, hi + 1)
+            if len(idx) < 5:
+                continue
+            xp, yp = coords[t] if coords is not None else xy0
+            Wimg, _ = bilinear(Pb[idx], xp, yp)
+            k = int(path[t]) - lo
+            for i, (h, c) in enumerate(zip(halves, cells)):
+                ev = E_lum[t][h]
+                if ev.std() < 1e-4 * (abs(ev.mean()) + 1e-6):
+                    continue
+                Wr, er = rank_rows(Wimg[:, h]), rank_rows(ev)
+                cost = _cell_cost(Wr, er, c)
+                votes[i].append(abs(int(np.argmin(cost)) - k) <= 1)
+                # untrimmed worst cells at the path frame: foreign action occupies only part of the half
+                order, starts, counts, keep = c
+                cm = (np.add.reduceat(np.abs(Wr[k] - er)[order], starts) / counts)[keep]
+                resid[i].append(float(np.percentile(cm, 90)) if len(cm) else 0.0)
+        if min(len(v) for v in votes) < 6:
+            continue
+        agree = [float(np.mean(v)) for v in votes]
+        res_ = [float(np.median(r)) for r in resid]
+        own = int(np.argmax(agree))
+        oth = 1 - own
+        ratio = res_[oth] / max(res_[own], 1e-6)
+        if agree[own] >= COMP_HALF_AGREE and agree[oth] <= COMP_HALF_OTHER and ratio >= COMP_RESID_RATIO:
+            gap = agree[own] - agree[oth]
+            if best is None or gap > best[0]:
+                best = (gap, dict(where=_where(halves[oth]), frac=float(halves[oth].sum()) / float(m.sum()),
+                                  mask=halves[oth], agree=(round(agree[own], 2), round(agree[oth], 2)),
+                                  ratio=round(ratio, 2), source='halves'))
+    return None if best is None else best[1]
+
+
+def composite_cut_region(E_lum, P_lum, m, path, E_valid, span, opt=None, coords=None, nref=24, grid=6):
+    """Is a 'post-cut image absent from this plate' run really a cut?
+    span = (a, b): the EDIT frames that match nowhere in the plate. A cut to another source changes
+    the whole frame. When the extra residual inside the run sits in one compact part of the frame and the
+    rest keeps matching at its usual level, another plate is composited into that part (split screen):
+    a spatial composite, not a temporal cut.
+    Returns dict(where, frac, mask, share, rest) for the part from the other plate, or None."""
+    E, He, We = E_lum.shape
+    P, Hp, Wp = P_lum.shape
+    a, b = int(span[0]), int(span[1])
+    run = np.zeros(E, bool)
+    run[max(0, a):min(E, b + 1)] = True
+    tin = np.where(run & E_valid)[0]
+    tout = np.where(~run & E_valid)[0]
+    if len(tin) < 3 or len(tout) < 6 or m.sum() < 64:
+        return None
+    tout = tout[np.linspace(0, len(tout) - 1, min(nref, len(tout))).astype(int)]
+    if len(tin) > nref:
+        tin = tin[np.linspace(0, len(tin) - 1, nref).astype(int)]
+    xy0 = None if coords is not None else warp_coords(He, We, Hp, Wp, opt['s'], opt['tx'], opt['ty'], opt['flop'])
+    qs = sorted(set(int(path[t]) for t in np.r_[tin, tout]))
+    Pb = dict(zip(qs, blur121(P_lum[qs])))
+
+    def resid(ts):
+        acc = np.zeros(int(m.sum()), np.float64)
+        for t in ts:
+            xp, yp = coords[t] if coords is not None else xy0
+            w = bilinear(Pb[int(path[t])], xp, yp)[0]
+            acc += np.abs(rank_rows(E_lum[t][m]) - rank_rows(w[m]))
+        R = np.zeros((He, We), np.float32)
+        R[m] = acc / len(ts)
+        return R
+
+    Rin, Rout = resid(tin), resid(tout)
+    Wm = m.astype(np.float32)
+    X, Ws_ = np.maximum(Rin - Rout, 0) * Wm, Wm.copy()
+    for _ in range(3):
+        X, Ws_ = blur121(X), blur121(Ws_)
+    X = np.where(m, X / np.maximum(Ws_, 1e-3), 0.0)
+    total = float(X.sum())
+    if total <= 1e-6:
+        return None
+    ys = np.minimum((np.arange(He) * grid) // He, grid - 1)
+    xs = np.minimum((np.arange(We) * grid) // We, grid - 1)
+    cid = ys[:, None] * grid + xs[None, :]
+    ex = np.bincount(cid[m], weights=X[m], minlength=grid * grid)
+    area = np.bincount(cid[m], minlength=grid * grid).astype(np.float64)
+    order = np.argsort(-ex)
+    cum = np.cumsum(ex[order]) / total
+    k = int(np.searchsorted(cum, COMP_EXCESS_SHARE)) + 1
+    hot = order[:k]
+    frac = float(area[hot].sum()) / float(m.sum())
+    if frac > COMP_EXCESS_AREA:
+        return None
+    mask = np.isin(cid, hot) & m
+    rest = m & ~_dilate(mask, 1)
+    if rest.sum() < 0.3 * m.sum():
+        return None
+    ratio = float(Rin[rest].mean()) / max(float(Rout[rest].mean()), 1e-6)
+    if ratio > COMP_REST_RATIO:
+        return None
+    return dict(where=_where(mask), frac=frac, mask=mask, share=round(float(cum[k - 1]), 2),
+                rest=round(ratio, 2), source='cut')
+
+
+def composite_reclassify(cuts, E_lum, P_lum, m, path, E_valid, opt=None, coords=None):
+    """Split suspected cuts into (real cuts, spatial-composite evidence).
+    Only 'image absent from this plate' runs are re-examined; TC jumps and jump-path cuts stay cuts."""
+    kept, comp = [], None
+    for c in cuts or []:
+        info = None
+        if c.get('mismatch') and not c.get('tc') and c.get('span'):
+            try:
+                info = composite_cut_region(E_lum, P_lum, m, path, E_valid, c['span'], opt=opt, coords=coords)
+            except Exception:
+                info = None
+        if info is None:
+            kept.append(c)
+            continue
+        if comp is None:
+            comp = dict(info, spans=[])
+        elif info['frac'] > comp['frac']:
+            comp.update(dict(info, spans=comp['spans']))
+        comp['spans'].append((int(c['span'][0]), int(c['span'][1])))
+    if comp is not None:
+        comp['spans'] = sorted(set(comp['spans']))
+    return kept, comp
 
 
 # Optical animation tracking (scale/reposition keys)
@@ -7746,6 +8252,29 @@ def solve(E_lum, P_lum, P_valid_files=None, detect_optical=True, allow_flop=True
         log(_t('[4] 분절컷 의심: %s', '[4] Possible cut: %s') % ', '.join('t=%d (%+d, excess %.1f%s)' % (
             c['t'], c['jump'], c['excess'], ', mismatch' if c['mismatch'] else '') for c in cuts))
 
+    # Split-composite mode: the residual-map detector above misses locked-off split screens (shared
+    # background, only the action differs). Half matching or a partial 'image absent' run then marks the
+    # part that comes from the other plate; keep only this plate's part and match again.
+    if detect_split and not split['split']:
+        comp = None
+        try:
+            comp = composite_reclassify(cuts, E_lum, P_lum, m, path, E_valid, opt=opt)[1] or \
+                composite_halves(E_lum, P_lum, m, path, E_valid, opt=opt)
+        except Exception as e:
+            log(_t('  분할합성 영역 검사 실패(무시): %s', '  Split-composite region check failed (ignored): %s') % e)
+        if comp is not None:
+            reg = mask0 & ~_dilate(comp['mask'], 1)
+            if reg.sum() >= 0.2 * mask0.sum():
+                split = dict(split=True, frac=float(reg.sum()) / float(max(mask0.sum(), 1)), where=_where(reg),
+                             ratio=float(comp.get('ratio') or comp.get('rest') or 0.0), source=comp['source'])
+                split_region = reg
+                mask0 = mask0 & reg
+                log(_t('[4] 분할합성 영역 (%s): 이 플레이트 %s %.0f%% — 다시 매칭',
+                       '[4] Split-composite region (%s): this plate %s %.0f%% — matching again') % (
+                    comp['source'], split['where'], 100 * split['frac']))
+                U, path, Ef, Pf, m, Wp_img = match(opt, newmask_feat & mask0)
+                cuts = cut_suspects(U, E_valid, P_valid, tcs['pins'], tcs['hints'], jumps, max_speed=max_speed)
+
     # 5. Optical animation (scale/reposition keys)
     trk = None
     t1 = None
@@ -7812,6 +8341,7 @@ def solve(E_lum, P_lum, P_valid_files=None, detect_optical=True, allow_flop=True
                                                      jumps=jumps, max_speed=max_speed)
             # if movement is animated, re-refine it with the final matching cost -> re-match (accepted only when the cost goes down)
             # cheaply once for tracks where only scale moves too (keys every 8 frames, plates +/-2): scale bias of the 64px NCC key search
+            # (1.0 -> 1.08 small zoom 0.041, fillcrop path -1 run). The full re-refinement of the experiment (±6, every 4 frames, 6 passes) cost +65 % time
             mv = max(np.ptp(trk['tx']), np.ptp(trk['ty'])) > 0.004
             for _it in range(6 if mv else TRACK_SREFINE_ITERS):
                 tr3 = refine_track_cost(E_lum, P_lum, trk, m2, E_valid, P_valid, path, stride=4 if mv else 8,
@@ -7975,6 +8505,7 @@ def solve(E_lum, P_lum, P_valid_files=None, detect_optical=True, allow_flop=True
             log(_t('[6] 등속 정렬: %d프레임 바뀜 (직선 경로의 이미지 비용이 DP 경로보다 낮음)', '[6] Constant-speed alignment: %d frames changed (straight path has lower image cost than DP path)') % int((sp != path).sum()))
             path = sp
     # near-hold (still) segments: detect stretches where the picture can hardly identify the source frame -> only 'indistinguishable' ones get a constant-speed line
+    # covered by confident TC = 'confirmed by TC'; weak evidence keeps the path (decision record 2026-10-23-near-hold-ambiguity)
     if _a3_checkpoint is not None:
         _a3_checkpoint.update(_a3_snapshot_state(dict(
         E=E, E_lum=E_lum, E_valid=E_valid, P=P, P_lum=P_lum,
@@ -8004,6 +8535,14 @@ def _solve_finish(E, E_lum, E_valid, P, P_lum, P_valid, U, Wp_img, coords, cuts,
         cuts = cut_suspects(U, E_valid, P_valid, tcs['pins'], tcs['hints'], jumps, max_speed=max_speed)
         static_candidate = None
         static_candidate_used_times = []
+    # 'Image absent from this plate' runs whose extra residual stays in one part of the frame come from
+    # another plate composited into that part (split screen); they are not cuts to another source.
+    # Only the reported list changes: the internal guards below keep treating those frames as cut-adjacent.
+    report_cuts, composite = composite_reclassify(cuts, E_lum, P_lum, m, path, E_valid, opt=opt, coords=coords)
+    if composite is not None:
+        log(_t('  분할합성 판정: 컷 의심 대신 화면 %s %.0f%%가 다른 플레이트 (EDIT %s)',
+               '  Split composite: instead of a cut, %s %.0f%% of the frame comes from another plate (EDIT %s)') % (
+            composite['where'], 100 * composite['frac'], ', '.join('%d-%d' % s for s in composite['spans'])))
     nh = []
     motion_adopted_info = None
     try:
@@ -8169,7 +8708,24 @@ def _solve_finish(E, E_lum, E_valid, P, P_lum, P_valid, U, Wp_img, coords, cuts,
     if conf['lowq'] > CONF_LOWQ_MAX:
         conf_warn.append('품질 낮은 프레임 %d%%' % round(100 * conf['lowq']))
     if half is not None and half < CONF_HALF_MIN:
-        conf_warn.append('상하 절반 합의 %d%%' % round(100 * half))
+        # A top/bottom split screen fails the half agreement by construction. When the half from this plate
+        # confirms the path on its own, report the composite instead of a low-confidence path.
+        try:
+            hc = composite_halves(E_lum, P_lum, m, path, E_valid, opt=opt, coords=coords)
+        except Exception as e:
+            log(_t('  분할합성 절반 검사 실패(무시): %s', '  Split-composite half check failed (ignored): %s') % e)
+            hc = None
+        if hc is not None:
+            conf['composite_half'] = hc['where']
+            log(_t('  분할합성 판정: 화면 %s가 다른 플레이트 (절반 합의 %.0f%% / %.0f%%, 잔차비 %.1f)',
+                   '  Split composite: the %s of the frame comes from another plate (half agreement %.0f%% / %.0f%%, residual ratio %.1f)') % (
+                hc['where'], 100 * hc['agree'][0], 100 * hc['agree'][1], hc['ratio']))
+            if composite is None:
+                composite = dict(hc, spans=[])
+        elif composite is not None and composite['where'].split(' ')[0] in ('상단', '하단'):
+            conf['composite_half'] = composite['where']  # the other plate sits in the top or bottom half
+        else:
+            conf_warn.append('상하 절반 합의 %d%%' % round(100 * half))
     if trk is not None and max(np.ptp(trk['tx']), np.ptp(trk['ty'])) > 0.004:
         pan = plate_pan_like(P_lum, path, E_valid)
         conf['pan'] = pan
@@ -8182,7 +8738,7 @@ def _solve_finish(E, E_lum, E_valid, P, P_lum, P_valid, U, Wp_img, coords, cuts,
         conf_warn.append('스케일 범위 밖(필러/레터박스 의심, 탐색 %.2f~%.2f)' % (SCALE_MIN, SCALE_MAX))
     log('  confidence: ambiguous %.0f%%, low %.0f%%, half agreement %s%s'
         % (100 * conf['amb'], 100 * conf['lowq'], '-' if half is None else '%.0f%%' % (100 * half),
-           ('  -> [!] ' + ', '.join(conf_warn)) if conf_warn else ''))
+           ('  -> [!] ' + ', '.join(_report_detail_text(v) for v in conf_warn)) if conf_warn else ''))
 
     # slow + zoom time normalization (only for optical animation + time-movement ambiguity + slow slope)
     tnorm = None
@@ -8245,7 +8801,9 @@ def _solve_finish(E, E_lum, E_valid, P, P_lum, P_valid, U, Wp_img, coords, cuts,
                                         if t not in pins and E_valid[t] and tcs['pins'].get(t) == q
                                         and int(path[t]) == int(q))
                                    if tc_track_values is not None else {}),
-                cuts=cuts, reversals=direction_changes(path, E_valid | excl),
+                cuts=report_cuts, reversals=direction_changes(path, E_valid | excl),
+                composite=(None if composite is None else
+                           dict((k, v) for k, v in composite.items() if k != 'mask')),
                 confidence=conf, confidence_warn=conf_warn, near_hold=nh)
 
 
@@ -8329,7 +8887,7 @@ def validate_temp_storage(custom=None):
     probe = None
     try:
         if os.path.lexists(root) and os.path.islink(root):
-            raise ValueError(_t('no_more_manual_retime 폴더가 심볼릭 링크입니다', 'no_more_manual_retime folder is a symbolic link'))
+            raise ValueError(_t('no_more_manual_retime 폴더가 심볼릭 링크입니다', 'The no_more_manual_retime folder is a symbolic link'))
         if not os.path.isdir(root):
             os.makedirs(root)
         for kind in _TEMP_KINDS:
@@ -8355,7 +8913,7 @@ def validate_temp_storage(custom=None):
                 pass
         raise RuntimeError(_t('임시 저장소를 사용할 수 없습니다: %s\n'
                            '쓰기 가능한 로컬 폴더를 고르거나 [기본값]으로 되돌려 주세요. (%s)',
-                           'Temporary storage is unavailable: %s\nChoose a writable local folder or restore Default. (%s)')
+                           'Temporary storage is unavailable: %s\nChoose a writable local folder or restore [Default]. (%s)')
                            % (temp_storage_base(custom), error))
 
 
@@ -8746,7 +9304,7 @@ def _paths_read(label, path):
             with open(path) as f:
                 data = json.load(f)
             if not isinstance(data, dict):
-                raise ValueError('최상위가 { } 객체가 아닙니다')
+                raise ValueError(_t('최상위가 { } 객체가 아닙니다', 'The top level is not a { } object'))
             d['data'] = data
         except Exception as ex:
             d['error'] = str(ex)
@@ -8888,7 +9446,8 @@ def _tmpl_regex(tmpl, known=None, roots=None):
             continue
         tl = (tok or 'frame').lower()
         if tl not in PATH_TOKENS + ('ext', 'frame'):
-            raise ValueError('알 수 없는 토큰 {%s} (쓸 수 있는 토큰: %s, {ext}, {frame})'
+            raise ValueError(_t('알 수 없는 토큰 {%s} (쓸 수 있는 토큰: %s, {ext}, {frame})',
+                                'Unknown token {%s} (available tokens: %s, {ext}, {frame})')
                              % (tok, ' '.join('{%s}' % t for t in PATH_TOKENS)))
         if known.get(tl):
             out.append(re.escape(str(known[tl])))
@@ -9737,13 +10296,13 @@ def _path_diagnostic_display(text):
     patterns = (
         (r"(\d+)번째 조각 '(.*)' 에서 멈춤 \(앞부분 '(.*)' 까지는 맞음\)",
          "Stopped at segment %s '%s' (prefix '%s' matched)", ()),
-        (r"(\d+)번째 조각 '(.*)' 에 맞는 (파일이|폴더가) 없습니다",
+        (r"(\d+)번째 조각 '(.*)' 에 맞는 (.+?) 없습니다",
          "Segment %s '%s': no matching %s", (2,)),
         (r'알 수 없는 토큰 \{(.*)\} \(쓸 수 있는 토큰: (.*), \{ext\}, \{frame\}\)',
          'Unknown token {%s} (supported: %s, {ext}, {frame})', ()),
         (r'찾은 파일 (\d+)개가 모두 조건\(레이어 · 확장자 · 최대 버전\)에서 빠졌습니다',
          'All %s files were excluded by layer, extension, or maximum-version filters.', ()),
-        (r'(스크립트|Read) 경로에서 찾음: (.*)', 'Found in %s path: %s', (0,)),
+        (r'(.+?) 경로에서 찾음: (.*)', 'Found in %s path: %s', (0,)),
         (r'템플릿: (.*)', 'Template: %s', ()),
         (r'토큰: (.*)', 'Tokens: %s', ()),
         (r'어느 경로에도 맞지 않습니다\. 기준 경로: (.*)', 'No path matched. Reference path: %s', ()),
@@ -9833,7 +10392,9 @@ def _node_label_extent(n, default_font_size=16, thumbnail_height=0):
         value = n['label'].value() or ''
     except Exception:
         value = ''
-    value = re.sub(r'(?i)<br\s*/?>', '\n', str(value))
+    table_rows = len(re.findall(r'(?i)</tr>', str(value)))  # a table row is taller than a text line (cell padding)
+    value = re.sub(r'(?i)<br\s*/?>|</tr>', '\n', str(value))  # a table row is a line
+    value = re.sub(r'(?i)</t[dh]>', '    ', value)  # cell padding between columns
     value = html.unescape(re.sub(r'<[^>]+>', '', value)).replace('\xa0', '')  # the NBSP added to secure width is not a character
     lines = value.splitlines() or ['']
     try:
@@ -9847,7 +10408,7 @@ def _node_label_extent(n, default_font_size=16, thumbnail_height=0):
                    for char in line)
 
     width = int(max(visual_width(line) for line in lines) * font_size * 0.48) + 32
-    height = int(len(lines) * font_size * 1.35) + 24 + int(thumbnail_height)
+    height = int(len(lines) * font_size * 1.35) + 24 + int(thumbnail_height) + table_rows * 10
     return width, height
 
 
@@ -9883,16 +10444,20 @@ def _node_rect(n):
     return x, y, x + max(w, 80), y + max(h, 20)
 
 
-def place_free(nodes, margin=24, log=print, pad=None, avoid_backdrops=False):
+def place_free(nodes, margin=24, log=print, pad=None, avoid_backdrops=False, rects=None, ignore=()):
     """
     move a group of newly created nodes as a whole to the nearest spot that does not overlap existing nodes.
     Preferred order: below > right > left > above. Connections are kept. Backdrops are not treated as obstacles
+    rects: plain (x0, y0, x1, y1) boxes placed like nodes without creating any node (job block reservation).
+    Returns the (dx, dy) shift that was applied. Boxes reserved by a running job (_RESERVED_RECTS) are obstacles.
+    ignore: nodes that are not obstacles (nodes this job created and will move together with the block)
     """
     nodes = [n for n in nodes if n is not None]
-    if not nodes:
-        return
+    if not nodes and not rects:
+        return (0, 0)
     own = set(n.fullName() for n in nodes)
-    R = np.array([_node_rect(n) for n in nodes], np.int64)
+    own.update(n.fullName() for n in ignore if n is not None)
+    R = np.array([_node_rect(n) for n in nodes] + [tuple(r) for r in (rects or ())], np.int64)
     gx0, gy0, gx1, gy1 = R[:, 0].min(), R[:, 1].min(), R[:, 2].max(), R[:, 3].max()
     if pad:  # the space for the backdrop must also be empty
         pl, pt, pr, pb = pad
@@ -9918,8 +10483,14 @@ def place_free(nodes, margin=24, log=print, pad=None, avoid_backdrops=False):
         r0 = max(0, (b0 - Y0) // cell)
         r1 = min(H - 1, (b1 - Y0) // cell + 1)
         occ[r0:r1, c0:c1] = 1
+    for a0, b0, a1, b1 in _RESERVED_RECTS:  # memory-only reservations of running jobs
+        a0, b0, a1, b1 = a0 - margin, b0 - margin, a1 + margin, b1 + margin
+        if a1 < X0 or a0 > X1 or b1 < Y0 or b0 > Y1:
+            continue
+        occ[max(0, (b0 - Y0) // cell):min(H - 1, (b1 - Y0) // cell + 1),
+            max(0, (a0 - X0) // cell):min(W - 1, (a1 - X0) // cell + 1)] = 1
     if not occ.any():
-        return
+        return (0, 0)
     S = np.zeros((H + 1, W + 1), np.int64)
     S[1:, 1:] = occ.cumsum(0).cumsum(1)
     dxs = np.arange(-3000, 3001, 30)
@@ -9940,12 +10511,16 @@ def place_free(nodes, margin=24, log=print, pad=None, avoid_backdrops=False):
         ok &= inside & (tot == 0)
     if not ok.any():
         log(_t('빈 자리를 찾지 못해 기본 위치에 둡니다', 'No free space found; using the default position.'))
-        return
+        return (0, 0)
     i = np.argmin(np.where(ok, cost, np.inf))
     dx, dy = int(DX[i]), int(DY[i])
     if dx or dy:
         for n in nodes:
             n.setXYpos(int(n.xpos()) + dx, int(n.ypos()) + dy)
+    return (dx, dy)
+
+
+_RESERVED_RECTS = []  # blocks reserved by running jobs; no node (and no backdrop) exists for them
 
 
 BD_PAD = (20, 148, 20, 30)  # backdrop padding (left, top (label), right, bottom) - measured from an example .nk
@@ -10249,14 +10824,30 @@ def attach_input_stamps(nodes, log=print, mode=None):
             log(_t('입력 참조 표시 보류: %s', 'Input-reference display held: %s') % error)
 
 
-def _layout_result_notes(nodes, horizontal_gap=80, vertical_gap=36):
-    """Stack owned result notes to the right of the generated graph and input stamps."""
+def _tile_rect(n):
+    """Node rectangle with the measured tile width: a Read keeps its real 80 px tile instead of the label-wide
+    footprint _node_rect reserves for collision avoidance. Used where the question is 'where does this column end'."""
+    x0, y0, x1, y1 = _node_rect(n)
+    if n.Class() == 'Read':
+        try:
+            x1 = x0 + max(int(n.screenWidth()), 80)
+        except Exception:
+            x1 = x0 + 80
+    return x0, y0, x1, y1
+
+
+def _layout_result_notes(nodes, horizontal_gap=12, vertical_gap=36):
+    """Stack owned result notes directly right of the generated graph, level with its top row
+    (user reference 2026-11-07: next to the plate Read, not far away). The right end of the graph is measured
+    from the real node widths, so a long Read label never pushes the note away from the main column."""
     notes = [node for node in nodes if node is not None and node.Class() == 'StickyNote']
     anchors = [node for node in nodes if node is not None
                and node.Class() not in ('StickyNote', 'BackdropNode')]
     if not notes or not anchors:
         return
-    right = max(_node_rect(node)[2] for node in anchors)
+    # Dot labels are Tcl that evaluates to (almost) nothing: never size them from the expression text
+    right = max(_tile_rect(node)[2] if node.Class() in ('Read', 'PostageStamp', 'Dot') else _dag_node_rect(node)[2]
+                for node in anchors)
     top = min(_node_rect(node)[1] for node in anchors)
     x = int(right + horizontal_gap)
     y = int(top)
@@ -10278,7 +10869,8 @@ def finalize_group(nodes, label, log=print, head='No More Manual Retime', status
     nodes = [n for n in nodes if n is not None and n.Class() != 'BackdropNode']
     if not nodes:
         return None
-    _layout_result_notes(nodes)
+    if head == 'No More Manual Retime':
+        _layout_result_notes(nodes)  # QC review keeps its note beside the Write (layout_qc_review)
     place_free(nodes, log=log, pad=BD_PAD, avoid_backdrops=True)
     R = np.array([_node_rect(n) for n in nodes])
     x0, y0 = int(R[:, 0].min()) - BD_PAD[0], int(R[:, 1].min()) - BD_PAD[1]
@@ -10320,7 +10912,7 @@ def finalize_failed_owned(error, label, log=print, head='No More Manual Retime')
     try:
         return finalize_group(nodes, label, log, head=head,
                               status=backdrop_result_status(
-                                  failed=True, failure_reason=str(error) or '실행 실패'))
+                                  failed=True, failure_reason=str(error) or _t('실행 실패', 'Run failed')))
     except Exception as backdrop_error:
         log(_t('실패 결과 백드롭 생성 실패(부분 노드는 유지): %s', 'Could not create failure backdrop (partial nodes retained): %s') % backdrop_error)
         return None
@@ -10498,11 +11090,113 @@ def create_plate_read(info, xpos, ypos, reuse=False):
         for k, v in (('first', info['first']), ('last', info['last']), ('origfirst', info['first']), ('origlast', info['last'])):
             _set(r, k, v)  # the plate range is the scanned value as is (may differ from the fromUserText guess)
         _set(r, 'origset', True)
+    _configure_plate_colorspace(r)
     return r
 
 
-def _render_luma(node, d, first, last, incr, box, crop_reformat, W, H, blur, log, rgb=False):
-    """ Keep transient render nodes in a visible, always-disposed Group."""
+PLATE_OCIO_FALLBACK = ('Output - Rec.709', 'rec709')  # same names the edit Read is given (_configure_edit_colorspace)
+
+
+def _configure_plate_colorspace(read):
+    """Keep the colorspace Nuke gave a newly loaded plate Read unless the active OCIO config does not define it.
+
+    A movie Read can come up with a name such as 'Gamma2.2' that an OCIO config (ACES, for one) lacks; the Read
+    is then in error and the run stops. Only in that case a Rec.709 name the config does define is set, the same
+    as for the edit Read. Without OCIO, or when the value (or the role / name inside 'default (...)') exists, or
+    when the config has no such name, the Read is left as it is. Returns the value set or None."""
+    ocio = _ocio_colorspace_names()
+    if not ocio:
+        return None
+    try:
+        knob = read['colorspace']
+        read.format()  # resolve Nuke's lazy default label
+        current = str(knob.value()).strip()
+        values = [str(v) for v in knob.values()]
+    except Exception:
+        return None
+    known = set(_colorspace_entry_name(n) for n in ocio)
+    roles = set()  # 'role\trole (Colorspace)': a role is valid when its target is defined
+    for value in values:
+        shown = value.split('\t', 1)[-1].strip()
+        if '\t' in value and shown.endswith(')') and ' (' in shown and shown[shown.index(' (') + 2:-1] in known:
+            roles.add(_colorspace_entry_name(value))
+    name = current[9:-1].strip() if current.startswith('default (') and current.endswith(')') else current
+    if _colorspace_entry_name(name) in known | roles:
+        return None
+    for want in PLATE_OCIO_FALLBACK:
+        if want in known:
+            try:
+                knob.setValue(want)
+            except Exception:
+                return None
+            return want if str(knob.value()) == want else None
+    return None
+
+
+TEMP_GROUP_SIZE = (140, 60)  # footprint kept free for the temporary analysis Group (body + one label line)
+TEMP_GROUP_BESIDE_GAP = 24  # horizontal gap between the input's drawn text and a Group placed beside it
+
+
+def temp_group_xy(node, exclude=None, size=TEMP_GROUP_SIZE):
+    """(x, y) for the temporary analysis Group: the free spot with the shortest input wire.
+    The old rule measured "right under the input" from the layout footprint of a Read (>= 160 px plus its label),
+    so even an unobstructed spot sat 200+ px below the drawn tile and an obstacle pushed it to 360 px.
+    Candidates are the spots under the input's label and the spots beside the drawn node (right, then left);
+    the wire length is measured from the node's drawn output (real tile size) to the Group's input.
+    This job's own reserved block is not an obstacle as a whole: its nodes are real nodes and are checked one by one."""
+    sx0, sy0, sx1, sy1 = _node_rect(node)
+    x, y0 = int(sx0), int(sy1) + 40
+    try:
+        w, h = size
+        margin = 16
+        boxes = []
+        own_rect = _JOB_LAYOUT['rect'] if _JOB_LAYOUT is not None else None
+        for other in nuke.allNodes():
+            if other is node or other is exclude or other.Class() == 'BackdropNode':
+                continue
+            try:
+                boxes.append(_node_rect(other))
+            except Exception:
+                continue
+        boxes += [tuple(r) for r in _RESERVED_RECTS if own_rect is None or tuple(r) != tuple(own_rect)]
+        def free(px, py):
+            return not any(px < b[2] + margin and px + w > b[0] - margin and py < b[3] + margin and py + h > b[1] - margin
+                           for b in boxes)
+
+        # drawn output point of the input (bottom centre of the real tile; a fresh node reports a compact size)
+        tile_w = _dag_tile_width(node)
+        try:
+            tile_h = max(int(node.screenHeight()), 18)
+        except Exception:
+            tile_h = 18
+        ox, oy = int(node.xpos()) + tile_w // 2, int(node.ypos()) + tile_h
+        tx0, ty0, tx1, ty1 = _dag_node_rect(node)  # drawn tile + name/label text, not the layout footprint
+        candidates = [(x, y0 + step * 40) for step in range(12)]
+        for px in (int(tx1) + TEMP_GROUP_BESIDE_GAP, int(tx0) - w - TEMP_GROUP_BESIDE_GAP):
+            candidates += [(px, int(node.ypos()) + step * 40) for step in range(5)]
+        # An input that sits inside this job's reserved block (a temporary Read) keeps its Group inside it too.
+        bounded = own_rect is not None and own_rect[0] <= node.xpos() <= own_rect[2] and own_rect[1] <= node.ypos() <= own_rect[3]
+        best = None
+        for cx, cy in candidates:
+            if not free(cx, cy):
+                continue
+            if bounded and not (own_rect[0] <= cx and cx + w <= own_rect[2] and own_rect[1] <= cy and cy + h <= own_rect[3]):
+                continue
+            wire = ((cx + w // 2 - ox) ** 2 + (cy - oy) ** 2) ** 0.5
+            if best is None or wire < best[0] - 1e-6:
+                best = (wire, cx, cy)
+        if best is not None:
+            return best[1], best[2]
+    except Exception:
+        pass
+    return x, y0
+
+
+def _render_luma(node, d, first, last, incr, box, crop_reformat, W, H, blur, log, rgb=False,
+                 chunks=None, before_chunk=None):
+    """ Keep transient render nodes in a visible, always-disposed Group.
+    chunks: [(start, end)] rendered one nuke.execute each with the same temporary nodes (default: first..last);
+    before_chunk(i) runs before chunk i and may raise Cancelled."""
     group = None
     try:
         previous_selection = list(nuke.selectedNodes())
@@ -10520,15 +11214,14 @@ def _render_luma(node, d, first, last, incr, box, crop_reformat, W, H, blur, log
 
     try:
         group = nuke.nodes.Group(name=_node_name('render_tmp'))
-        source_rect = _node_rect(node)
-        group.setXYpos(source_rect[0], source_rect[3] + 40)
+        group.setXYpos(*temp_group_xy(node, exclude=group))  # right under the input, never a far slot
         _set(group, 'label', _t('분석 중 · 임시 노드', 'Analyzing · temporary node'))
         group.setInput(0, node)
         restore_selection()
         with group:
             source = nuke.nodes.Input()
             _render_luma_nodes(source, d, first, last, incr, box, crop_reformat,
-                               W, H, blur, log, rgb)
+                               W, H, blur, log, rgb, chunks=chunks, before_chunk=before_chunk)
     finally:
         try:
             if group is not None:
@@ -10540,7 +11233,8 @@ def _render_luma(node, d, first, last, incr, box, crop_reformat, W, H, blur, log
             restore_selection()
 
 
-def _render_luma_nodes(node, d, first, last, incr, box, crop_reformat, W, H, blur, log, rgb=False):
+def _render_luma_nodes(node, d, first, last, incr, box, crop_reformat, W, H, blur, log, rgb=False,
+                       chunks=None, before_chunk=None):
     """ (formerly the body of ensure_thumbs) node -> Crop(box) -> luminance (alpha) -> W x H -> EXR half"""
     tmp = []
     try:
@@ -10590,7 +11284,11 @@ def _render_luma_nodes(node, d, first, last, incr, box, crop_reformat, W, H, blu
         _set(wr, 'metadata', 'no metadata')
         wr.setInput(0, crop2)
         tmp += [crop2, wr]
-        nuke.execute(wr, first, last, incr, continueOnError=True)
+        with _frame_heartbeat():
+            for i, (start, end) in enumerate(chunks or [(first, last)]):
+                if before_chunk is not None:
+                    before_chunk(i)
+                nuke.execute(wr, start, end, incr, continueOnError=True)
     finally:
         for n in tmp:
             try:
@@ -10612,6 +11310,7 @@ def set_render_watch(watch):
 
 def _watch_tick(index, count, tag):
     """Keep the watching window alive during per-frame loading loops."""
+    heartbeat()
     if _RENDER_WATCH is not None and index % 48 == 0:
         _RENDER_WATCH(index, count, tag)
 
@@ -10646,13 +11345,16 @@ def _ensure(node, d, first, last, incr, box, crop_reformat, W, H, blur, reuse, l
     if _RENDER_WATCH is None or len(chunks) < 2:
         chunks = [(missing[0], missing[-1])]
     total = len(range(missing[0], missing[-1] + 1, incr))
-    done = 0
+    # One set of temporary nodes for every chunk: creating/deleting a Group of nodes per chunk costs
+    # callbacks and Node Graph updates that grow with the size of the open script.
+    done = [0]
     for start, end in chunks:
-        if _RENDER_WATCH is not None:
-            _RENDER_WATCH(done, total, tag)
-        with NoUndo():
-            _render_luma(node, d, start, end, incr, box, crop_reformat, W, H, blur, log, rgb)
-        done += len(range(start, end + 1, incr))
+        done.append(done[-1] + len(range(start, end + 1, incr)))
+    watch = _RENDER_WATCH
+    with NoUndo():
+        _render_luma(node, d, chunks[0][0], chunks[-1][1], incr, box, crop_reformat, W, H, blur, log, rgb,
+                     chunks=chunks,
+                     before_chunk=None if watch is None else (lambda i: watch(done[i], total, tag)))
     if _RENDER_WATCH is not None:
         _RENDER_WATCH(total, total, tag)
     return len(missing), time.time() - t0
@@ -11493,7 +12195,7 @@ def validate_region_storage(custom=None, user_config=None):
                 pass
         raise RuntimeError(_t('임시 저장소를 사용할 수 없습니다: %s\n'
                               '쓰기 가능한 로컬 폴더를 고르거나 [기본값]으로 되돌려 주세요. (%s)',
-                              'Local storage is unavailable: %s\n'
+                              'Temporary storage is unavailable: %s\n'
                               'Choose a writable local folder or restore [Default]. (%s)')
                            % (path, error))
 
@@ -11520,9 +12222,55 @@ def _region_dir():
 
 
 # layout (offsets relative to the PLATE Read) - measured from the user's example .nk
-LAY = dict(edit=(-350, 5), tw=(0, 188), fr=(0, 238), rf=(0, 276), tr=(0, 328),
-           to=(-350, 183), mg=(-350, 328), dot=(-316, 418), mg_step=230,  # 160 -> 230 (if a look Grade exists, keep the gap to the next shot even when the Difference-Dot moves down by the Grade height) Difference-Dot gap 38 -> 90 (so it reads as a QC branch)
-           report=(250, 168), summary=(-100, 68), region=(130, 238), region_rf=(130, 276))
+LAY = dict(edit=(-199, -5), tw=(0, 248), fr=(0, 298), rf=(0, 336), tr=(0, 388),
+           to=(-199, 243), mg=(0, 483), dot=(34, 573), mg_step=230,  # 2026-11-07 user reference layout: edit column on the left (x measured by edit_column_dx), one B pipe down the plate column
+           report=(250, 168), summary=(-100, 68), region=(130, 298), region_rf=(130, 336))
+QC_DIFF_DROP = 95  # Difference sits this far below the end of the output tree (user reference)
+DIFF_LAYOUTS = (('pipe', 'B 파이프 (Difference가 플레이트 열 안)'), ('branch', '옆 가지 (분기 Dot + 옆 QC 칸)'))
+DIFF_LAYOUT_TIP = ('QC Difference를 놓는 방식\n'
+                   'B 파이프: 출력 트리 한 줄 안에 두고 에딧은 왼쪽 칸에서 수평으로 들어옵니다 (기본, TimeWarp만 복사하기 쉬움)\n'
+                   '옆 가지: 분기 Dot으로 옆 QC 칸에 둡니다 (이전 방식)')
+DIFF_LAYOUT_TIP_EN = ('How the QC Difference is placed\n'
+                      'B pipe: inside the single output column, the edit enters horizontally from the left column '
+                      '(default; the TimeWarp is easy to copy alone)\n'
+                      'Side branch: a branch Dot feeds a side QC column (the previous layout)')
+
+
+BATCH_PLACES = (('group', '한 곳에 모음'), ('near', '플레이트 근처'))
+BATCH_PLACE_TIP = ('배치 실행 결과를 놓는 위치\n'
+                   '한 곳에 모음: 샷 결과를 격자로 가지런히 모으고 배치 전체 백드롭으로 감쌉니다 (기본)\n'
+                   '플레이트 근처: 샷마다 그 플레이트 바로 아래에 결과를 둡니다 (단일 실행과 같음). 배치 전체 백드롭은 만들지 않고 QC 리뷰는 첫 샷 근처에 둡니다')
+BATCH_PLACE_TIP_EN = ('Where a batch puts its results\n'
+                      'Gather in one place: shot results are lined up in a grid inside one batch backdrop (default)\n'
+                      'Near the plates: each shot result sits right under its own plate (as in a single run). No batch backdrop is made '
+                      'and the QC review goes near the first shot')
+
+
+def batch_place_mode(value=None):
+    """'group' (default) or 'near'. Without value, follow the saved window setting (batch_place)."""
+    if value is None:
+        value = _ui_get('batch_place', 'group')
+    return 'near' if str(value or '').strip().lower() == 'near' else 'group'
+
+
+def diff_layout_mode(value=None):
+    """'pipe' (default) or 'branch'. Without value, follow the saved window setting (diff_layout)."""
+    if value is None:
+        value = _ui_get('diff_layout', 'pipe')
+    return 'branch' if str(value or '').strip().lower() == 'branch' else 'pipe'
+
+
+def edit_column_dx(tag, edit_name=''):
+    """x offset of the edit column from the plate column (both 80 px tiles): measured from the node names
+    of the two columns so neither runs into the other, never closer than the user's reference arrangement."""
+    plate_text = max(len(_node_name(prefix + tag)) for prefix in
+                     ('input_', 'optical_', 'reframe_Beta_', 'look_', 'QC_diff_', 'QC_mp_'))
+    edit_text = max(len(_node_name('input_' + str(edit_name))), len(_node_name('EDIT_offset')) + 2)
+    plate_half = max(80, plate_text * 7 + 12) / 2.0
+    edit_half = max(80, edit_text * 7 + 12) / 2.0
+    return -max(199, int(math.ceil(plate_half + QC_COL_GAP + edit_half)))
+
+
 DOT_LABEL = r'[expr {[string match "Dot*" [value name]] ? " " : [regsub {(\d+)$} [value name] ""]}]'
 
 
@@ -11534,7 +12282,8 @@ def build_edit_offset(edit, edit_first, out_first, plate=None, owned_nodes=None)
                                                name=_uname(_node_name('EDIT_offset'))), owned_nodes)
     to.setInput(0, edit)
     if plate is not None:
-        to.setXYpos(plate.xpos() + LAY['to'][0], plate.ypos() + LAY['to'][1])
+        bx, by = layout_xy(plate)
+        to.setXYpos(bx + edit_column_dx(plate.name(), edit.name()), by + LAY['to'][1])
     else:
         to.setXYpos(edit.xpos(), edit.ypos() + 178)
     return to
@@ -11775,15 +12524,46 @@ def _build_optical_transform(edit, source, res, out_first, tag, px, py, beta=Fal
         review = policy['review']
         risks = policy.get('risks') or []
         detail = policy.get('risk_detail') or ''
-        tr['label'].setValue('Reframe Output (Beta) — %s%s' % (
+        tr['label'].setValue(_t('Reframe Output (Beta) — %s%s', 'Reframe Output (Beta) — %s%s') % (
             'animated' if animated else 'static',
             (_t('\n검토 필요: ', '\nReview required: ') +
-             _report_detail_text(detail or ', '.join(risks))) if review else ''))
+             (_report_detail_text(detail) if detail else ', '.join(_report_detail_text(v) for v in risks))) if review else ''))
     elif animated:
-        tr['label'].setValue('animated optical')
+        tr['label'].setValue(_t('animated optical', 'animated optical'))
     tr.setInput(0, rf)
     tr.setXYpos(px + LAY['tr'][0], py + LAY['tr'][1])
     return rf, tr
+
+
+def qc_column_offset(tag, diff_name):
+    """Distance from the plate column centre to the QC column centre on its left, measured from the
+    text widths of the plate-column nodes beside the QC rows (optical/look/timecode) and of the
+    Difference itself, so neither name runs into the other (~7 px per DAG character)."""
+    plate_text = max(len(_node_name(prefix + tag)) for prefix in ('optical_', 'reframe_Beta_', 'look_', 'timecode_'))
+    plate_half = max(80, plate_text * 7 + 12) / 2.0
+    diff_half = max(80, len(str(diff_name)) * 7 + 12) / 2.0
+    return int(math.ceil(plate_half + QC_COL_GAP + diff_half))
+
+
+def qc_branch_y(plate_node):
+    """ypos that centres the 12 px branch Dot on the plate node (18 px tile until Nuke reports its size)."""
+    return int(plate_node.ypos() + ((_node_height(plate_node) or 18) - 12) // 2)
+
+
+def qc_diff_branch(difference):
+    """(plate-side B source, branch Dot or None) of a QC Difference."""
+    b = difference.input(0)
+    if b is not None and b.Class() == 'Dot' and _node_name_startswith(b, 'QC_branch_'):
+        return b.input(0), b
+    return b, None
+
+
+def qc_edit_dot(difference):
+    """The edit-column Dot feeding a B-pipe Difference's A input, or None (side-branch or older graphs)."""
+    a = difference.input(1)
+    if a is not None and a.Class() == 'Dot' and _node_name_startswith(a, 'QC_edit_'):
+        return a
+    return None
 
 
 def qc_transform_node(created, beta=False):
@@ -11801,9 +12581,14 @@ def _apply_qc_grade_branch(created, tr, look, tag=''):
     if tr is None or look.get('status') != 'applied':
         return tr, None
     differences = [node for node in created if node.Class() == 'Merge2'
-                   and _node_name_startswith(node, 'QC_diff_') and node.input(0) is tr]
+                   and _node_name_startswith(node, 'QC_diff_') and qc_diff_branch(node)[0] is tr]
     if not differences:
         return tr, None
+
+    def feed(node, source):
+        # the branch Dot (B pipe) or, for graphs built before it, the Difference's B input
+        target = qc_diff_branch(node)[1] or node
+        target.setInput(0, source)
     params = look['params']
     apply_qc_grade_rgb(np.zeros((1, 3)), params)  # validate before making a node
     grade = None
@@ -11835,13 +12620,13 @@ def _apply_qc_grade_branch(created, tr, look, tag=''):
             pass
         grade.setXYpos(tr.xpos(), tr.ypos() + 60)
         for node in differences:
-            node.setInput(0, grade)
+            feed(node, grade)
         created.append(grade)
         align_qc_diff_to_input(differences, grade, created)
         return grade, grade
     except Exception:
         for node in differences:
-            node.setInput(0, tr)
+            feed(node, tr)
         if grade is not None:
             nuke.delete(grade)
         raise
@@ -11855,21 +12640,47 @@ def _node_height(node):
 
 
 def align_qc_diff_to_input(differences, plate_node, created=()):
-    """ make the plate (B) input line of the QC Difference horizontal: Merge center y = center y of the plate node (look Grade or Transform).
-    The Dot below the Merge moves down by the same amount to keep the gap."""
+    """Keep the QC branch level with the end of the output tree (look Grade or Transform).
+
+    B pipe (2026-11-06): the branch Dot's centre goes to the plate node's centre line, so the plate
+    stream leaves the output tree horizontally and then runs straight down into the Difference's B
+    input; the Difference and its output Dot move by the same amount, keeping the column vertical.
+    Graphs without a branch Dot keep the rule: Merge centre level with the plate node."""
     for mg in differences:
-        want = plate_node.ypos() + (_node_height(plate_node) - _node_height(mg)) // 2
-        delta = int(want - mg.ypos())
+        branch = qc_diff_branch(mg)[1]
+        edit_dot = qc_edit_dot(mg)
+        if edit_dot is not None:
+            # B pipe in the plate column: the Difference keeps its drop below the end of the output tree
+            delta = int(plate_node.ypos() + QC_DIFF_DROP - mg.ypos())
+            if delta:
+                mg.setXYpos(mg.xpos(), mg.ypos() + delta)
+                edit_dot.setXYpos(edit_dot.xpos(), edit_dot.ypos() + delta)
+                for dot in created:
+                    if dot.Class() == 'Dot' and dot.input(0) is mg:
+                        dot.setXYpos(dot.xpos(), dot.ypos() + delta)
+            continue
+        if branch is not None:
+            delta = int(qc_branch_y(plate_node) - branch.ypos())
+        else:
+            delta = int(plate_node.ypos() + (_node_height(plate_node) - _node_height(mg)) // 2 - mg.ypos())
         if not delta:
             continue
+        if branch is not None:
+            branch.setXYpos(branch.xpos(), branch.ypos() + delta)
         mg.setXYpos(mg.xpos(), mg.ypos() + delta)
         for dot in created:
             if dot.Class() == 'Dot' and dot.input(0) is mg:
                 dot.setXYpos(dot.xpos(), dot.ypos() + delta)
 
 
-def run_done_headline(outcome, ok=None, total=None, secs=None, cancelled=False):
-    """ the first line of the status line when a run finishes. Symbol + text (color is conveyed separately by the dot / close button)"""
+def run_done_headline(outcome, ok=None, total=None, secs=None, cancelled=False, need=None):
+    return _singular(_run_done_headline(outcome, ok, total, secs, cancelled, need))
+
+
+def _run_done_headline(outcome, ok=None, total=None, secs=None, cancelled=False, need=None):
+    """ the first line of the status line when a run finishes. Symbol + text (color is conveyed separately by the dot / close button)
+    need: shots that finished with a review reason, when the caller counts them apart from failed / skipped / never-run
+    shots (a batch, from batch_done_counts). Without it every shot that is not a clean success counts as review."""
     spent = '' if secs is None else _t(' · %.1f초', ' · %.1f s') % secs
     if cancelled:
         return _t('■ 취소됨', '■ Cancelled') + spent
@@ -11880,12 +12691,19 @@ def run_done_headline(outcome, ok=None, total=None, secs=None, cancelled=False):
         if counted:
             return _t('✓ 완료 — %d샷 중 %d샷 성공', '✓ Done — %d shots, %d succeeded') % (total, ok) + spent
         return _t('✓ 완료', '✓ Done') + spent
-    need = (total - ok) if counted else 0
+    split = counted and need is not None
+    need = need if split else (total - ok) if counted else 0
     if counted and need > 0:
-        if ok <= 0:
-            return _t('! 완료 — %d샷 확인 필요', '! Done — %d shots need review') % need + spent
-        return _t('! 완료 — %d샷 중 %d샷 성공 · %d샷 확인 필요',
-                  '! Done — %d shots, %d succeeded · %d need review') % (total, ok, need) + spent
+        if ok <= 0 and (not split or need == total):
+            text = _t('! 완료 — %d샷 확인 필요', '! Done — %d shots need review') % need
+        else:
+            text = _t('! 완료 — %d샷 중 %d샷 성공 · %d샷 확인 필요',
+                      '! Done — %d shots, %d succeeded · %d need review') % (total, ok, need)
+        if need == 1:
+            text = text.replace(' need review', ' needs review')  # English verb agreement for one shot
+        return text + spent
+    if split:
+        return _t('! 완료 — %d샷 중 %d샷 성공', '! Done — %d shots, %d succeeded') % (total, ok) + spent
     return _t('! 완료 — 확인 필요', '! Done — review needed') + spent
 
 
@@ -11904,6 +12722,17 @@ def run_done_detail(existing):
 def run_done_status_text(headline, existing):
     detail = run_done_detail(existing)
     return headline + ('  ·  ' + detail if detail else '')
+
+
+def done_release_signals(widgets, kinds):
+    """Signals of every user-editable input widget: any of them preparing a new job releases the run-finished emphasis.
+    kinds is ((widget class, signal name), ...); a widget matching several kinds yields each signal."""
+    found = []
+    for widget in widgets:
+        for cls, name in kinds:
+            if isinstance(widget, cls):
+                found.append(getattr(widget, name))
+    return found
 
 
 def run_has_result(outcome, counts, cancelled):
@@ -11959,7 +12788,8 @@ def timewarp_output_lookup(res):
 
 
 def build_nodes(edit, plate, res, plate_first, out_first, edit_qc=None, qc_anchor=None, qc_index=0,
-                out_node='timewarp', reframe_output=False, owned_nodes=None, interpolation='linear'):
+                out_node='timewarp', reframe_output=False, owned_nodes=None, interpolation='linear',
+                diff_layout='pipe'):
     """
     under plate: TimeWarp + FrameRange
     if edit_qc (TimeOffset) exists: Reformat -> optical Transform -> difference (split-region mask)
@@ -11967,7 +12797,7 @@ def build_nodes(edit, plate, res, plate_first, out_first, edit_qc=None, qc_ancho
     path = res['path']
     E = len(path)
     out_last = out_first + E - 1
-    px, py = plate.xpos(), plate.ypos()
+    px, py = layout_xy(plate)  # reserved job block (or the plate itself outside a job)
     tag = plate.name()
 
     tw = _register_owned(nuke.nodes.TimeWarp(name=_uname(TIMEWARP_NODE_NAME)), owned_nodes)
@@ -12007,20 +12837,46 @@ def build_nodes(edit, plate, res, plate_first, out_first, edit_qc=None, qc_ancho
     if edit_qc is None:
         return created
 
-    # the QC difference goes in the EDIT column (below TimeOffset) + output Dot
-    ax, ay = (qc_anchor.xpos(), qc_anchor.ypos()) if qc_anchor is not None else (px, py)
-    dy = LAY['mg_step'] * qc_index
     mg = _register_owned(nuke.nodes.Merge2(
         operation='difference', name=_uname(_node_name('QC_diff_' + tag))), owned_nodes)
-    mg.setInput(0, tr)  # B = plate
-    mg.setInput(1, edit_qc)  # A = edit
-    mg.setXYpos(ax + LAY['mg'][0], ay + LAY['mg'][1] + dy)
-    dot = _register_owned(nuke.nodes.Dot(), owned_nodes)
-    dot.setInput(0, mg)
-    dot.setXYpos(ax + LAY['dot'][0], ay + LAY['dot'][1] + dy)
-    _set(dot, 'label', DOT_LABEL)
-    _set(dot, 'note_font_size', 30)
-    created += [mg, dot]
+    if diff_layout_mode(diff_layout) == 'pipe':
+        # B pipe (user reference 2026-11-07): the Difference sits directly in the plate column right under the
+        # output tree (B = plate stream); the edit (A) enters horizontally from a Dot in the edit column on the
+        # left. Pixels are unchanged (B = plate, A = edit; a Dot passes the stream through).
+        mg.setInput(0, tr)
+        edit_dot = _register_owned(nuke.nodes.Dot(name=_uname(_node_name('QC_edit_' + tag))), owned_nodes)
+        edit_dot.setInput(0, edit_qc)
+        mg.setInput(1, edit_dot)
+        mg.setXYpos(px + LAY['mg'][0], tr.ypos() + QC_DIFF_DROP)
+        edit_dot.setXYpos(px + edit_column_dx(tag, edit.name()) + 34, mg.ypos() + 3)
+        dot = _register_owned(nuke.nodes.Dot(), owned_nodes)
+        dot.setInput(0, mg)
+        dot.setXYpos(px + LAY['dot'][0], mg.ypos() + 90)
+        _set(dot, 'label', DOT_LABEL)
+        _set(dot, 'note_font_size', 30)
+        created += [edit_dot, mg, dot]
+    else:
+        # Side branch (previous layout): a branch Dot beside the tail carries the plate stream straight down
+        # into the Difference's B input in its own QC column, and the edit (A) comes in from the left.
+        branch = _register_owned(nuke.nodes.Dot(name=_uname(_node_name('QC_branch_' + tag))), owned_nodes)
+        branch.setInput(0, tr)
+        mg.setInput(0, branch)  # B = plate (through the branch Dot)
+        mg.setInput(1, edit_qc)  # A = edit
+        cx = px + 40 - qc_column_offset(tag, mg.name())
+        drop = 0
+        edit_cx = px + edit_column_dx(tag, edit.name()) + 40
+        if cx < edit_cx + QC_COL_GAP:
+            # Very long names: keep the QC column right of the edit column and start the Difference
+            # below the plate-column rows beside it (look Grade) instead.
+            cx, drop = edit_cx + QC_COL_GAP, 2 * 60
+        branch.setXYpos(int(cx - 6), qc_branch_y(tr))
+        mg.setXYpos(int(cx - 40), tr.ypos() + 60 + drop)
+        dot = _register_owned(nuke.nodes.Dot(), owned_nodes)
+        dot.setInput(0, mg)
+        dot.setXYpos(int(cx - 6), tr.ypos() + 150 + drop)
+        _set(dot, 'label', DOT_LABEL)
+        _set(dot, 'note_font_size', 30)
+        created += [branch, mg, dot]
 
     # split composite: reference mask of this plate's region
     if res.get('region') is not None:
@@ -12072,6 +12928,21 @@ def output_timecode_message(plan, out_first):
             '[expr (%(n)s/%(r)d)%%60] [expr %(n)s%%%(r)d]]') % dict(n=count, h=rate * 3600, m=rate * 60, r=rate)
 
 
+def plate_tc_lookup_message(timewarp_name, plate_first, plate_base=None, plate_last=None):
+    """Text message: the plate TC of the frame the TimeWarp lookup picks at the frame being drawn, TCL only.
+    The lookup is read live from the TimeWarp (no copied key list, so it cannot drift), and plate_base gives the TC
+    of plate_first. Without a usable plate TC it shows 'f<plate frame>' like the QC review label.
+    Valid on any node downstream of the TimeWarp, where the frame being drawn is the output frame."""
+    pick = 'int(floor([value %s.lookup]+0.5))' % timewarp_name
+    if plate_base and not (len(plate_base) > 2 and plate_base[2] is True):
+        rate = max(1, int(round(float(plate_base[0] or 24.0))))
+        n = '(%d+%s-%d)' % (int(plate_base[1]), pick, int(plate_first))
+        return ('[format %%02d:%%02d:%%02d:%%02d [expr %(n)s/%(h)d] [expr (%(n)s/%(m)d)%%60] '
+                '[expr (%(n)s/%(r)d)%%60] [expr %(n)s%%%(r)d]]') % dict(n=n, h=rate * 3600, m=rate * 60, r=rate)
+    width = len(str(int(plate_last if plate_last is not None else plate_first)))
+    return 'f[format %%0%dd [expr %s]]' % (width, pick)
+
+
 def output_timecode_label(plan, out_first):
     """ output TC node label: which TC it came from + the first output frame"""
     if plan['source'] == 'edit':
@@ -12094,7 +12965,8 @@ def output_tree_tail(created, grade=None):
 
 def add_output_timecode(created, tail, edit, plate, edit_first, plate_first, res, out_first,
                         owned_nodes=None, log=print):
-    """Text overlay (NMMR_timecode_<PLATE>) at the end of the output tree, after the QC branch point so QC is unaffected:
+    """Legacy: no longer called (user decision 2026-11-07: the output TC node is not created; existing NMMR_timecode_*
+    nodes from older runs are still recognised by name). Text overlay (NMMR_timecode_<PLATE>) at the end of the output tree:
     the running EDIT TC (first output frame = TC of the first EDIT frame). If the EDIT TC is unknown, the TC of the plate frame
     used by the first output frame + shown in the label. Returns (node, plan)"""
     if tail is None:
@@ -12113,7 +12985,12 @@ def add_output_timecode(created, tail, edit, plate, edit_first, plate_first, res
     fmt = edit.format()
     size = max(10, int(round(fmt.height() * 0.03)))
     margin = max(4, int(round(fmt.height() * 0.02)))
-    node = _qc_text_node(tail, output_timecode_message(plan, int(out_first)),
+    message = output_timecode_message(plan, int(out_first))
+    tw = next((n for n in created if n.Class() == 'TimeWarp'), None)
+    if plan['source'] == 'plate' and tw is not None:
+        # Plate TC follows the frame the lookup picks (holds, ramps and reverse), not a running count
+        message = plate_tc_lookup_message('root.' + tw.fullName(), plate.firstFrame(), base, plate.lastFrame())
+    node = _qc_text_node(tail, message,
                          (margin, margin, fmt.width() - margin, margin + size * 2), True, False, size,
                          (1, 1, 1), _qc_fonts()[0], _node_name('timecode_' + plate.name()), owned_nodes)
     _set(node, 'label', output_timecode_label(plan, int(out_first)))
@@ -12124,6 +13001,52 @@ def add_output_timecode(created, tail, edit, plate, edit_first, plate_first, res
         log(_t('[%s] EDIT TC 없음 — 출력 TC 노드는 %s', '[%s] No EDIT TC — output TC node uses %s') % (
             plate.name(), _t('플레이트 TC', 'the plate TC') if plan['source'] == 'plate' else '00:00:00:00'))
     return node, plan
+
+
+def add_qc_plate_tc_label(created, edit, plate, res, out_first, opts, tc_roi=None, owned_nodes=None, log=print):
+    """Plate TC label (the QC review 'MP' label and layout) on the node-tree QC branch only: inserted between the
+    QC Difference and its Dot, so viewing the Dot shows the plate TC the TimeWarp lookup picks at each output frame
+    ('f<frame>' when the plate has no TC). Nothing follows it, so no Transform moves or scales it, and the Difference,
+    the output branch and the review render are unchanged. One MP Group (build_mp_label_group) with its own user
+    knobs; at the default knob values it renders the same pixels as the earlier flat Rectangle + two Text nodes,
+    which older scripts keep and are still recognized as tool nodes by their prefix. Returns the Group."""
+    mg = next((n for n in created if n.Class() == 'Merge2' and _node_name_startswith(n, 'QC_diff_')), None)
+    dot = next((n for n in created if n.Class() == 'Dot' and mg is not None and n.input(0) is mg), None)
+    tw = next((n for n in created if n.Class() == 'TimeWarp'), None)
+    if mg is None or dot is None or tw is None:
+        return None
+    pf, pl = plate.firstFrame(), plate.lastFrame()
+    base = plate_tc_base(plate, pf, pl, log)  # same TC base as the QC review label (_qc_mp_strings)
+    has_tc = bool(base)
+    W, H = edit.format().width(), edit.format().height()
+    layout = qc_review_layout(W, H, opts, tc_roi)  # above the edit burn-in TC region, like the review render
+    # absolute lookup path: the Text is evaluated inside the Group
+    msg = plate_tc_lookup_message('root.' + tw.fullName(), pf, base, pl)
+    tag = plate.name()
+
+    def width(node):
+        try:
+            return int(node.screenWidth())
+        except Exception:
+            return 80
+
+    group = build_mp_label_group(None, msg, layout, opts, _qc_fonts()[0], log, _node_name('QC_mp_' + tag),
+                                 owned_nodes, link_parent=False, label='MP TC' if has_tc else 'MP f#')
+    made, last = [group], group
+    made[0].setInput(0, mg)
+    dot.setInput(0, last)
+    # one straight column under the Difference; the Dot keeps its gap below the last label node
+    gap = dot.ypos() - mg.ypos() - _node_height(mg)
+    y = mg.ypos() + _node_height(mg) + 24
+    for node in made:
+        node.setXYpos(mg.xpos() + (width(mg) - width(node)) // 2, y)
+        y += _node_height(node) + 24
+    dot.setXYpos(dot.xpos(), y - 24 + max(24, gap - 24))
+    created.extend(made)
+    if not has_tc:
+        log(_t('[%s] 플레이트 TC 없음 — QC 브랜치 MP 라벨은 프레임 번호(f…)로 표시',
+               '[%s] No plate TC — QC branch MP label shows frame numbers (f...)') % tag)
+    return last
 
 
 def match_score(cost):
@@ -12297,7 +13220,19 @@ def report_text(res, edit, plate, edit_first, plate_first, out_first):
         if message:
             L.append('[!] ' + message)
     sp_ = res.get('split') or {}
-    if res.get('manual_region_rect'):
+    sr = res.get('split_roi')
+    if sr:
+        r = sr['rect']
+        area = (_t('그린 영역 밖 전체', 'everything outside the drawn region') if sr.get('invert') else
+                _t('그린 영역', 'drawn region'))
+        L.append(_t('분할합성 영역: %s x %.1f–%.1f%% / y %.1f–%.1f%% → 이 플레이트가 가장 잘 맞음 (%s)',
+                    'Split-composite region: %s x %.1f–%.1f%% / y %.1f–%.1f%% → best matched by this plate (%s)') % (
+            area, 100 * r[0], 100 * r[2], 100 * r[1], 100 * r[3],
+            ', '.join('%s %.4f' % (k.split('.')[-1], v) for k, v in sorted((sr.get('scores') or {}).items()))))
+        if sr.get('drawn_on') and sr['drawn_on'] != sr.get('plate'):
+            L.append(_t('  (영역은 %s에서 그렸지만 그림이 이 플레이트와 맞아 바꿨습니다)',
+                        '  (drawn on %s, but the image matches this plate, so it was reassigned)') % sr['drawn_on'])
+    elif res.get('manual_region_rect'):
         r = res['manual_region_rect']
         L.append(_t('수동 PLATE 영역 (Beta): x %.1f–%.1f%% / y %.1f–%.1f%% · 원본 %s',
                     'Manual PLATE region (Beta): x %.1f–%.1f%% / y %.1f–%.1f%% · source %s') % (
@@ -12364,6 +13299,22 @@ def report_text(res, edit, plate, edit_first, plate_first, out_first):
     st = tc_status(res)
     if st:
         L.append(_t('렉TC: %s — %s', 'Burn-in TC: %s — %s') % (st[0], st[2].replace('\n', ' / ')))
+    tci = res.get('tc') or {}
+    if tci.get('mode') == TC_MODE_ONLY:
+        if tci.get('filled'):
+            L.append(_t('[!] TC만: 보간한 프레임(읽지 못해 앞뒤 TC 사이를 직선으로 채움) EDIT %s — 확인 필요',
+                        '[!] TC only: interpolated frames (unread; filled on a straight line between neighboring TC) at EDIT %s — review') %
+                     _ranges(edit_first + np.array(tci['filled'])))
+        if tci.get('extended'):
+            L.append(_t('[!] TC만: 가장자리 연장 프레임(읽지 못해 일정 속도로 연장) EDIT %s — 확인 필요',
+                        '[!] TC only: edge-extended frames (unread; continued at constant speed) at EDIT %s — review') %
+                     _ranges(edit_first + np.array(tci['extended'])))
+        if tci.get('jumps'):
+            L.append(_t('TC만: TC 점프 EDIT %s', 'TC only: TC jumps at EDIT %s') % ', '.join(
+                '%d (%+d)' % (edit_first + int(t), int(d)) for t, d in tci['jumps']))
+        if tci.get('solver_moved'):
+            L.append(_t('TC만: 솔버가 %d프레임을 다르게 풀었지만 TC 경로를 유지함',
+                        'TC only: the solver differed on %d frames; the TC path was kept') % tci['solver_moved'])
     pre = res.get('tc_preflight')
     if pre:
         L.append(_t('TC 사전검사 (Beta): 판독 %s / 범위 %s / 이미지 %s · %.4g fps · TC 영역 %s',
@@ -12384,6 +13335,8 @@ def report_text(res, edit, plate, edit_first, plate_first, out_first):
                     '(컷 뒤 첫 프레임에 고정점 또는 배제 후 재실행)',
                     '[!] Possible cut: EDIT %d / OUT %d  %s — connected using speed changes only; review this range (pin the first frame after the cut or exclude the range and rerun)')
                  % (edit_first + c['t'], out_first + c['t'], cut_desc(c)))
+    if res.get('composite'):
+        L.append('[!] ' + composite_desc(res['composite'], edit_first, split_mode=bool(sp_.get('split'))))
     L += near_hold_report_lines(res.get('near_hold') or [], edit_first, out_first)
     if res.get('reversals'):
         L.append(_t('역방향 전환(정보): OUT %s', 'Reverse-direction transitions (info): OUT %s') % ', '.join(str(out_first + t) for t in res['reversals']))
@@ -12394,7 +13347,7 @@ def report_text(res, edit, plate, edit_first, plate_first, out_first):
     L.append(frame_accuracy_text(res))
     # Authored copy is localized at generation. Node/source names are user data
     # a blanket Hangul fallback here would erase those identifiers in EN mode.
-    return '\n'.join(L)
+    return _singular('\n'.join(L))
 
 
 def report_display_html(txt):
@@ -12553,7 +13506,7 @@ def look_reason_text(reason):
         'residual_or_unstable_look': _t('차이가 크거나 룩이 일정하지 않음', 'large residual difference or inconsistent look'),
         'extreme_or_unstable_fit': _t('보정값이 과도하거나 불안정함', 'extreme or unstable correction'),
         'region_not_supported': _t('부분영역·분할합성은 아직 미지원', 'partial-region and split-composite matching are not yet supported'),
-        'qc_disabled': _t('QC 트리와 리뷰가 꺼져 있음', 'QC tree and review are disabled'),
+        'qc_disabled': _t('QC 노드 세트와 리뷰가 꺼져 있음', 'QC node set and review are disabled'),
         'qc_format_mismatch': _t('QC 입력 포맷 불일치', 'QC input formats do not match'),
         'qc_crop_not_supported': _t('QC 입력 영역 불일치', 'QC input regions do not match'),
     }.get(reason, _t('비교 자료 또는 Grade 생성 확인 필요', 'check comparison data or Grade creation'))
@@ -12579,6 +13532,10 @@ def _note_tc_line(res):
         return _t('TC: 사용 안 함 (판독 안 함)', 'TC: not used (not read)')
     info = res.get('tc') or {}
     cov = '%.0f%%' % (100 * plan.get('coverage', 0))
+    if info.get('mode') == TC_MODE_ONLY:
+        fill = len(info.get('filled') or ()) + len(info.get('extended') or ())
+        return _t('TC: 전용 (이미지 매칭 없음) · %s%s', 'TC: only (no image matching) · %s%s') % (
+            cov, (_t(' · 보간 %d프레임', ' · %d frames interpolated') % fill) if fill else '')
     mode = info.get('mode') or ('none' if plan.get('mode') == 'first' else plan.get('mode'))
     if mode == 'increment_mismatch':
         return _t('TC: 약한 힌트로만 사용 (프레임마다 흔들림) · %s', 'TC: weak hints only (fluctuates between frames) · %s') % cov
@@ -12625,8 +13582,8 @@ def result_note_lines(res, edit_name, plate_name, edit_first, plate_first, out_f
     n = len(path)
     out_last = out_first + n - 1
     lines = [('title', 'NMMR · %s' % plate_name),
-             ('meta', 'EDIT %s · %d-%d (%d f) · build %s · %s' % (
-                 edit_name, edit_first, edit_first + n - 1, n, NMMR_VERSION, _note_seconds(total_seconds)))]
+             ('meta', 'EDIT %s · %d-%df · build %s · %s' % (
+                 edit_name, edit_first, edit_first + n - 1, NMMR_VERSION, _note_seconds(total_seconds)))]
 
     warns = []
     infos = []  # info lines - not counted in the needs-checking decision (still TC/pin confirmed, weak evidence, good coverage)
@@ -12686,7 +13643,7 @@ def result_note_lines(res, edit_name, plate_name, edit_first, plate_first, out_f
     lines.append(status)
     lines.extend(('warn', w) for w in warns)
     lines.extend(('info', w) for w in infos)
-    lines.append(('map', 'EDIT %df → PLATE %df · OUT %d-%d' % (
+    lines.append(('map', 'EDIT %df → PLATE %df · OUT %d-%df' % (
         edit_first, plate_first + int(path[0]), out_first, out_last)))
     lines.append(('tc', _note_tc_line(res)))
     lines.append(('tc', frame_accuracy_text(res)))
@@ -12804,6 +13761,22 @@ def set_report_tab(node, text):
     return knob
 
 
+def composite_desc(comp, edit_first=0, split_mode=False):
+    """Description of a spatial (split-screen) composite: two clips in one frame, not a cut."""
+    spans = ', '.join('%d-%d' % (edit_first + a, edit_first + b) for a, b in comp.get('spans') or [])
+    where = _report_detail_text(comp.get('where') or '')
+    text = _t('분할합성으로 보임: 화면 %s(약 %.0f%%)는 이 플레이트가 아니라 다른 플레이트에서 온 그림입니%s. '
+              '컷이 아니라 두 클립을 한 화면에 합성한 샷입니다.',
+              'Looks like a split composite: the %s of the frame (about %.0f%%) comes from another plate%s. '
+              'Two clips are composited in one frame; this is not a cut.') % (
+        where, 100 * float(comp.get('frac') or 0),
+        (_t('다 (EDIT %s에서 드러남)', ' (visible at EDIT %s)') % spans) if spans else _t('다', ''))
+    if not split_mode:
+        text += _t(' 부분마다 따로 리타임하려면 [분할합성]을 켜고 두 플레이트를 모두 체크해 다시 실행하세요.',
+                   ' To retime each part separately, turn on Split composite, check both plates and run again.')
+    return text
+
+
 def cut_desc(c):
     """ one-line description of a suspected split cut"""
     if c.get('tc'):
@@ -12876,7 +13849,7 @@ def _candidates():
     """
     nodes = list(nuke.allNodes('Read'))
     for n in nuke.selectedNodes():
-        if n not in nodes:
+        if n.Class() == 'Read' and n not in nodes:  # Backdrop / StickyNote / Dot etc. are never sources
             nodes.append(n)
     nodes = [n for n in nodes if not _is_tool_node_name(n)]
     nodes.sort(key=lambda n: (n.ypos(), n.xpos()))
@@ -12937,8 +13910,8 @@ _OPTS = (('optical', '옵티컬(리사이즈/리포지션) 감지'),
          ('track', '옵티컬 애니메이션(스케일/리포지션 키) 추적'),
          ('flop', 'flop 검사'),
          ('slow', '슬로우(보간) 감지'),
-         ('cleanup', '작업 후 썸네일 캐시 삭제 (끄면 남겨서 재실행 시 재사용)'),
-         ('qc', 'QC 트리 생성'),
+         ('cleanup', '작업 후 썸네일 캐시 삭제'),
+         ('qc', 'QC 노드 세트 생성'),
          ('qc_look', 'QC 룩 매치 (Beta)'),
          ('secondary_qc', '2차 QC 검사 (Beta)'),
          ('reframe_output', '리프레임 출력 (Beta)'),
@@ -12947,7 +13920,7 @@ _OPTS = (('optical', '옵티컬(리사이즈/리포지션) 감지'),
 
 def option_default(key):
     """Shared option defaults for Qt, classic Panel, single and batch flows."""
-    return key not in ('qc_refine', 'reframe_output', 'secondary_qc')  # look match on by default
+    return key not in ('qc_refine', 'secondary_qc')  # look match on by default; reframe output also on by default (2026-11-08)
 
 
 def option_saved_default(key):
@@ -12987,7 +13960,7 @@ def ask_settings():
     dlg.setMinimumWidth(640)
     lay = QtWidgets.QVBoxLayout(dlg)
 
-    lay.addWidget(QtWidgets.QLabel('EDIT (편집본)'))
+    lay.addWidget(QtWidgets.QLabel(_t('EDIT (편집본)', 'EDIT')))
     cb_edit = QtWidgets.QComboBox()
     for n in nodes:
         cb_edit.addItem(_node_label(n), n.fullName())
@@ -12997,8 +13970,8 @@ def ask_settings():
 
     # mode selection
     mode_row = QtWidgets.QHBoxLayout()
-    rb_norm = QtWidgets.QRadioButton('일반')
-    rb_split = QtWidgets.QRadioButton('분할합성 (소스 플레이트 여러 개)')
+    rb_norm = QtWidgets.QRadioButton(_t('일반', 'Standard'))
+    rb_split = QtWidgets.QRadioButton(_t('분할합성 (소스 플레이트 여러 개)', 'Split composite (several source plates)'))
     rb_norm.setChecked(True)
     mode_row.addWidget(rb_norm)
     mode_row.addWidget(rb_split)
@@ -13052,8 +14025,9 @@ def ask_settings():
     except Exception:
         max_speed_pref = 16
     sp_max_speed.setValue(max_speed_pref)
-    sp_max_speed.setToolTip('자동 탐색이 허용할 최대 배속. 4×는 기존 한도, 8–16×는 필요한 구간에서만 탐색 범위를 넓힙니다')
-    form.addRow('최대 배속', sp_max_speed)
+    sp_max_speed.setToolTip(_t('자동 탐색이 허용할 최대 배속. 4×는 기존 한도, 8–16×는 필요한 구간에서만 탐색 범위를 넓힙니다',
+                               'Maximum speed allowed during automatic search. 4× is the original limit; 8–16× widens the search range only where needed.'))
+    form.addRow(_t('최대 배속', 'Maximum speed'), sp_max_speed)
     lay.addLayout(form)
 
     def ff_changed(*_):
@@ -13082,7 +14056,7 @@ def ask_settings():
         split = rb_split.isChecked()
         cb_plate.setVisible(not split)
         lst.setVisible(split)
-        lb_plate.setText('PLATE (분할된 소스 플레이트를 모두 체크해 주세요)' if split else 'PLATE')
+        lb_plate.setText(_t('PLATE (분할된 소스 플레이트를 모두 체크해 주세요)', 'PLATE (check every split source plate)') if split else 'PLATE')
         dlg.adjustSize()
     rb_split.toggled.connect(sync_mode)
     sync_mode()
@@ -13092,7 +14066,7 @@ def ask_settings():
         cb_lookup.addItem(label, key)
     cb_lookup.setCurrentIndex(cb_lookup.findData(lookup_interpolation(_ui_get('lookup_interpolation', 'linear'))))
     cb_lookup.setToolTip(LOOKUP_INTERPOLATION_TIP)
-    lay.addWidget(QtWidgets.QLabel('lookup 키 보간'))
+    lay.addWidget(QtWidgets.QLabel(_t('lookup 키 보간', 'Lookup key interpolation')))
     lay.addWidget(cb_lookup)
     checks = {}
     for key, label in _OPTS:
@@ -13459,6 +14433,23 @@ def tc_status(res):
     elif plan.get('tentative'):
         tip.append(_t('플레이트 TC 메타데이터 없음 — 첫 프레임 = 00:00:00:00 으로 잠정',
                       'Plate TC metadata absent — provisionally using 00:00:00:00 for the first frame'))
+    if info.get('mode') == TC_MODE_ONLY:
+        filled = sorted(list(info.get('filled') or ()) + list(info.get('extended') or ()))
+        tip.append(_t('TC만: 이미지 매칭 없이 번인 TC와 같은 플레이트 TC 프레임을 그대로 씀 (판독 %d프레임)',
+                      'TC only: each frame uses the plate frame with the same timecode as its burn-in TC, without image matching (%d frames read)') % info.get('read', 0))
+        if filled:
+            tip.append(_t('읽지 못해 앞뒤 TC로 채운 프레임 %d개 (%d프레임 이하 구간만, 위치는 Report)',
+                          '%d unread frames filled from neighboring TC (gaps of %d frames or less; frames listed in the Report)') % (
+                len(filled), info.get('max_gap', TC_ONLY_MAX_GAP)))
+        if info.get('jumps'):
+            tip.append(_t('TC 점프 %d곳 (분절컷 의심)', '%d TC jumps (possible cuts)') % len(info['jumps']))
+        tip.append(tc_only_slow_note())
+        tip.append(_t('TC끼리 맞춘 결과라 독립적인 프레임 정확도가 아닙니다 — QC로 확인해 주세요',
+                      'This follows TC alone, so it is not an independent frame-accuracy check — review it in QC'))
+        label = _t('TC만 · ', 'TC only · ') + cov
+        if filled:
+            label += _t(' · 보간 %d', ' · %d interpolated') % len(filled)
+        return label, 'warn' if filled or info.get('jumps') else 'ok', '\n'.join(tip)
     mode = info.get('mode') or ('none' if plan['mode'] == 'first' else plan['mode'])
     if mode == 'increment_mismatch':
         tip.append(_t('렉TC가 프레임마다 흔들림: 독립 이미지 경로와 증가폭 불일치 %.0f%% — 약한 힌트로만 사용',
@@ -13507,6 +14498,7 @@ def tc_status(res):
     return _t('TC 미사용 · ', 'TC unused · ') + cov, 'dim', '\n'.join(tip)
 
 
+# near-hold (still) segment wording (decision record section 6, option B)
 # Display by grade: indistinguishable = warning (orange, warning window, hatching), weak evidence = info (gray, dotted line, no warning window - it appeared in 33 of 158
 # normal edits, so gray to avoid warning fatigue), confirmed by TC / pin = info (green)
 # insufficient evidence (needs checking) = the weak-evidence cases that fall under rule E (anchor on one side / no anchor + edit difference >= 7) = warning (orange, warning window, hatching), handling unchanged
@@ -13568,11 +14560,11 @@ def span_tip(s, edit_first=None, out_first=None, plate_first=None, path=None):
     if st == 'tc':
         L.append(_t('번인 TC %d프레임을 확신 판독해 TC를 따랐습니다',
                     '%d burn-in TC frames were read confidently, so the path follows TC') % s.get('tc_n', 0))
-        return '\n'.join(L)
+        return _singular('\n'.join(L))
     if st == 'pin':
         L.append(_t('고정점 %d개를 기준으로 앞뒤를 일정 속도로 이었습니다',
                     '%d pins connect the surrounding frames at a constant speed') % s['pinned'])
-        return '\n'.join(L)
+        return _singular('\n'.join(L))
     if st == 'ambiguous':
         L.append(_t('그림만으로는 어느 소스 프레임인지 정할 수 없습니다 — 불확실 %s프레임',
                     'The image alone cannot identify the source frame — uncertainty %s frames') % _unc_text(s))
@@ -13616,14 +14608,14 @@ def span_tip(s, edit_first=None, out_first=None, plate_first=None, path=None):
         L.append(_t('확정: 구간 처음과 끝의 소스 프레임을 확인한 뒤 고정점 2개로 지정',
                     'Confirm: check the first and last source frames, then set two pins'))
     elif st == 'unsure':
-        L.append(_t('확정: 번인 TC 가 있으면 [TC 우선]으로 다시 실행 / 구간 처음과 끝 근처에 고정점 2개 / 화면만 맞으면 그대로 사용',
-                    'Confirm: rerun with [TC priority] if burn-in TC is available / set two pins near the range '
+        L.append(_t('확정: 번인 TC 가 있으면 [번인 TC 모드: 자동]으로 다시 실행 / 구간 처음과 끝 근처에 고정점 2개 / 화면만 맞으면 그대로 사용',
+                    'Confirm: rerun with [Burn-in TC mode: Auto] if burn-in TC is available / set two pins near the range '
                     'endpoints / keep it if the image is acceptable'))
     else:
-        L.append(_t('확정: 번인 TC 가 있으면 [TC 우선]으로 다시 실행 / 구간 처음과 끝 근처에 고정점 / 화면만 맞으면 그대로 사용',
-                    'Confirm: rerun with [TC priority] if burn-in TC is available / set pins near the range '
+        L.append(_t('확정: 번인 TC 가 있으면 [번인 TC 모드: 자동]으로 다시 실행 / 구간 처음과 끝 근처에 고정점 / 화면만 맞으면 그대로 사용',
+                    'Confirm: rerun with [Burn-in TC mode: Auto] if burn-in TC is available / set pins near the range '
                     'endpoints / keep it if the image is acceptable'))
-    return '\n'.join(L)
+    return _singular('\n'.join(L))
 
 
 def near_hold_status(spans, E, edit_first=None, out_first=None, plate_first=None, path=None):
@@ -13692,10 +14684,10 @@ def near_hold_dialog(spans, plate_name, edit_first=0):
         for s in uns:
             L.append('  %s  EDIT %d-%d  %s' % (plate_name, edit_first + s['t0'], edit_first + s['t1'], _unc_text(s)))
         L.append(_t('경로는 이미지 매칭 그대로 두었습니다 (직선으로 바꾸지 않음). 화면상 차이는 미미해도 그레인 · 트래킹 · 컨폼에는 '
-                    '프레임 정체가 중요할 수 있습니다.\n번인 TC 가 있으면 [TC 우선]으로 다시 실행하거나, 구간 처음과 끝 근처에 '
+                    '프레임 정체가 중요할 수 있습니다.\n번인 TC 가 있으면 [번인 TC 모드: 자동]으로 다시 실행하거나, 구간 처음과 끝 근처에 '
                     '고정점 2개를 두면 확정됩니다. 화면만 맞으면 그대로 써도 됩니다.',
                     'The image-matched path was retained (no linear replacement). Even a minor visible difference can matter for grain, tracking and conform.\n'
-                    'Confirm by rerunning with [TC priority] if burn-in TC is available, or by setting two pins near the range endpoints. '
+                    'Confirm by rerunning with [Burn-in TC mode: Auto] if burn-in TC is available, or by setting two pins near the range endpoints. '
                     'You can keep the result if the image is acceptable.'))
         paras.append('\n'.join(L))
     return '\n\n'.join(paras)
@@ -13707,12 +14699,12 @@ def _nh_dialog_amb(amb, plate_name, edit_first):
     for s in amb:
         L.append('  %s  EDIT %d-%d  %s' % (plate_name, edit_first + s['t0'], edit_first + s['t1'], _unc_text(s)))
     L.append(_t('이 구간은 일정 속도로 이었습니다. 화면상 차이는 미미하지만 그레인 · 트래킹 · 컨폼에는 프레임 정체가 중요할 수 있습니다.\n'
-                '번인 TC 가 있으면 [TC 우선]으로 다시 실행하거나, 구간 처음과 끝 근처에 고정점을 두면 확정됩니다. '
+                '번인 TC 가 있으면 [번인 TC 모드: 자동]으로 다시 실행하거나, 구간 처음과 끝 근처에 고정점을 두면 확정됩니다. '
                 '화면만 맞으면 그대로 써도 됩니다.',
                 'These ranges were connected at constant speed. The visible difference may be minor, but exact frame identity can matter for grain, tracking and conform.\n'
-                'Confirm by rerunning with [TC priority] if burn-in TC is available, or by setting pins near the range endpoints. '
+                'Confirm by rerunning with [Burn-in TC mode: Auto] if burn-in TC is available, or by setting pins near the range endpoints. '
                 'You can keep the result if the image is acceptable.'))
-    return '\n'.join(L)
+    return _singular('\n'.join(L))
 
 
 def near_hold_report_lines(spans, edit_first, out_first):
@@ -13729,15 +14721,15 @@ def near_hold_report_lines(spans, edit_first, out_first):
                         'Hold confirmed by pins: %s (%d pins)') % (rng, s['pinned']))
         elif st == 'ambiguous':
             L.append(_t('[!] 프레임 구분 불가: %s (%d f, %s) — 이웃 프레임 그림 차이 최대 %.1f %% / 편집본 차이 %.1f %%, 일정 속도로 이음. '
-                        'TC 우선 또는 고정점으로 확정',
-                        '[!] Indistinguishable frames: %s (%d f, %s) — maximum neighboring-frame image difference %.1f %% / edit residual %.1f %%; joined at constant speed. Confirm with TC priority or pins') % (rng, s['n'], _unc_text(s), s['diff_max'], s['resid']))
+                        '자동 모드(번인 TC) 또는 고정점으로 확정',
+                        '[!] Indistinguishable frames: %s (%d f, %s) — maximum neighboring-frame image difference %.1f %% / edit residual %.1f %%; joined at constant speed. Confirm with Auto burn-in TC or pins') % (rng, s['n'], _unc_text(s), s['diff_max'], s['resid']))
         elif st == 'unsure':
             anchor = _ANCHOR_TEXT.get(s.get('anchor'), '부족하고') if ui_language() != 'en' else {
                 'start': 'before the range only', 'end': 'after the range only',
                 'none': 'on neither side', 'both': 'on both sides'}.get(s.get('anchor'), 'insufficient')
             L.append(_t('[!] 정지 구간 근거 부족(확인 필요): %s (%d f, %s) — 앞뒤 확정 프레임이 %s 편집본 차이 %.1f %% (기준 %g 이상), '
-                        '이웃 프레임 그림 차이 최대 %.1f %%, 이미지 경로 유지. TC 우선 또는 고정점 2개로 확정',
-                        '[!] Insufficient hold evidence (review required): %s (%d f, %s) — confirmed frames: %s; edit residual %.1f %% (threshold >= %g), maximum neighboring-frame image difference %.1f %%; image path retained. Confirm with TC priority or two pins')
+                        '이웃 프레임 그림 차이 최대 %.1f %%, 이미지 경로 유지. 자동 모드(번인 TC) 또는 고정점 2개로 확정',
+                        '[!] Insufficient hold evidence (review required): %s (%d f, %s) — confirmed frames: %s; edit residual %.1f %% (threshold >= %g), maximum neighboring-frame image difference %.1f %%; image path retained. Confirm with Auto burn-in TC or two pins')
                      % (rng, s['n'], _unc_text(s), anchor, s['resid'], NH_UNSURE_RESID,
                         s['diff_max']))
         else:
@@ -14063,12 +15055,16 @@ class JobCtx(object):
     def __init__(self, log=None, progress=None, cancelled=None, ask=None):
         self.log = log or _console
         self._p, self._c, self._a = progress, cancelled, ask
+        raw = self.log
+        self.log = lambda s: (heartbeat(), raw(_singular(s)))[1]  # every log line is also a heartbeat
 
     def progress(self, frac, msg=None):
+        heartbeat()
         if self._p:
             self._p(max(0.0, min(1.0, frac)), msg)
 
     def cancelled(self):
+        heartbeat()  # loops poll this every step
         return bool(self._c and self._c())
 
     def ask(self, msg):
@@ -14147,6 +15143,163 @@ def tc_plan(tcf, raw, pf, pl, b0, E, tentative=False):
         out['mode'] = 'hint'
         out['hints_abs'] = inr
     return out
+
+
+def tc_mode_value(value):
+    """Normalized burn-in TC mode. Anything other than TC only is the default Auto mode."""
+    return TC_MODE_ONLY if value == TC_MODE_ONLY else TC_MODE_PRIORITY
+
+
+def tc_only_chip_visible(tc_on, mode):
+    """The main-window 'TC only' chip shows only while burn-in TC is on and the TC only mode is selected."""
+    return tc_only_requested({'tc': tc_on, 'tc_mode': mode})
+
+
+def tc_only_requested(opts):
+    """TC only applies only when burn-in TC is switched on for the run."""
+    return bool(opts.get('tc')) and tc_mode_value(opts.get('tc_mode')) == TC_MODE_ONLY
+
+
+def _tc_only_line(val, a, b, t):
+    """Value at t of the straight line through reads a and b."""
+    return val[a] + (val[b] - val[a]) * (t - a) / float(b - a)
+
+
+def tc_only_map(tcf, b0, pf, pl, max_gap=TC_ONLY_MAX_GAP, max_speed=16):
+    """Map every EDIT frame's confident burn-in TC to the plate frame with the same timecode (independent of Nuke).
+    tcf: per-frame confident TC frame counts (None = unread), b0: TC frame count of plate frame pf.
+    Unread runs of at most max_gap frames between two consistent reads are filled linearly. Runs at the clip
+    edges are extended only from three evenly stepping reads. Nothing else is guessed: isolated reads that
+    disagree with their neighbours, reads outside the plate and longer or inconsistent gaps are reported.
+    Returns dict(ok, frames (absolute plate frames, None unless ok), read, filled, extended, jumps [(t, step)],
+                 gaps [(t0, t1)], inconsistent, outside, max_gap)."""
+    E = len(tcf or [])
+    cap = min(max(1, int(max_speed)), 16)
+    val = [None if v is None else int(pf) + int(v) - int(b0) for v in (tcf or [])]
+    times = [t for t in range(E) if val[t] is not None]
+    out = dict(ok=False, frames=None, read=len(times), filled=[], extended=[], jumps=[], gaps=[],
+               inconsistent=[], outside=[], max_gap=int(max_gap))
+    if not times:
+        out['gaps'] = [(0, E - 1)] if E else []
+        return out
+    out['outside'] = [t for t in times if not pf <= val[t] <= pl]
+    # A misread is an isolated value off the line through its neighbours. Real cuts keep going after the jump
+    # so they stay within half of the neighbour difference. A misread also bends its neighbours' lines, so only the
+    # worst offender is removed per pass and the rest are re-tested against new neighbours.
+    bad = set()
+    for _ in range(64):
+        keep = [t for t in times if t not in bad]
+        worst, worst_ratio, flagged = None, 1.0, []
+        for i, t in enumerate(keep):
+            if 0 < i < len(keep) - 1:
+                a, b = keep[i - 1], keep[i + 1]
+                thr = max(TC_ONLY_SPIKE_MIN, 0.5 * abs(val[b] - val[a]))
+            elif len(keep) >= 3:
+                a, b = (keep[1], keep[2]) if i == 0 else (keep[-3], keep[-2])
+                rate = abs(val[b] - val[a]) / float(b - a)
+                thr = max(TC_ONLY_SPIKE_MIN, rate * min(abs(t - a), abs(t - b)) + 0.5 * abs(val[b] - val[a]))
+            else:
+                continue
+            ratio = abs(val[t] - _tc_only_line(val, a, b, t)) / float(thr)
+            if ratio > 1.0:
+                flagged.append(t)
+                if ratio > worst_ratio:
+                    worst, worst_ratio = t, ratio
+        if worst is None:
+            break
+        bad.add(worst)
+    else:
+        bad |= set(flagged)  # too many to untangle: the shot fails either way
+    out['inconsistent'] = sorted(bad)
+    good = [t for t in times if t not in bad]
+    frames = [None] * E
+    for t in good:
+        frames[t] = val[t]
+    for a, b in zip(good, good[1:]):
+        if b - a <= 1 or any(a < t < b for t in bad):
+            continue
+        if b - a - 1 <= max_gap and abs(val[b] - val[a]) <= cap * (b - a):
+            for t in range(a + 1, b):
+                frames[t] = int(math.floor(_tc_only_line(val, a, b, t) + 0.5))
+                out['filled'].append(t)
+        else:
+            out['gaps'].append((a + 1, b - 1))
+
+    def extend(edge, run, reads):
+        # reads run away from the edge; steps are per frame in forward time
+        steps = [(val[reads[1]] - val[reads[0]]) * (reads[1] - reads[0]),
+                 (val[reads[2]] - val[reads[1]]) * (reads[2] - reads[1])]
+        even = (abs(reads[1] - reads[0]) == 1 and abs(reads[2] - reads[1]) == 1 and steps[0] == steps[1]
+                and abs(steps[0]) <= cap)
+        values = [val[edge] + steps[0] * (t - edge) for t in run]
+        if len(run) <= max_gap and even and all(pf <= v <= pl for v in values):
+            for t, v in zip(run, values):
+                frames[t] = int(v)
+                out['extended'].append(t)
+        elif run:
+            out['gaps'].append((run[0], run[-1]))
+    if good and good[0] > 0 and not any(t < good[0] for t in bad):
+        if len(good) >= 3:
+            extend(good[0], list(range(0, good[0])), good[:3])
+        else:
+            out['gaps'].append((0, good[0] - 1))
+    if good and good[-1] < E - 1 and not any(t > good[-1] for t in bad):
+        if len(good) >= 3:
+            extend(good[-1], list(range(good[-1] + 1, E)), good[-3:][::-1])
+        else:
+            out['gaps'].append((good[-1] + 1, E - 1))
+    out['gaps'].sort()
+    out['extended'].sort()
+    if out['gaps'] or out['inconsistent'] or out['outside'] or any(v is None for v in frames):
+        return out
+    out['jumps'] = [(t, frames[t] - frames[t - 1]) for t in range(1, E) if abs(frames[t] - frames[t - 1]) > cap]
+    out.update(ok=True, frames=frames)
+    return out
+
+
+def tc_only_no_plate_tc_text(name):
+    return _t('[%s] TC만 모드는 플레이트 타임코드가 필요합니다. 이 플레이트에는 쓸 수 있는 TC가 없습니다'
+              '(메타데이터와 파일 TC 트랙이 없거나 불연속). 자동(이미지 + TC) 또는 이미지만 분석으로 실행해 주세요.',
+              '[%s] TC only needs plate timecode. This plate has no usable TC (no metadata or file TC track, '
+              'or the TC is discontinuous). Run with Auto (image + TC) or image-only analysis instead.') % name
+
+
+def tc_only_no_read_text(name):
+    return _t('[%s] TC만: 편집본 번인 TC를 읽지 못했습니다(TC 보정 없음 또는 판독 실패). '
+              '[TC 보정…]을 확인하거나 자동(이미지 + TC) 또는 이미지만 분석으로 실행해 주세요.',
+              '[%s] TC only: the edit burn-in TC could not be read (no TC calibration, or the read failed). '
+              'Check [Calibrate TC…], or run with Auto (image + TC) or image-only analysis instead.') % name
+
+
+def tc_only_failure_text(name, mapping, edit_first=0):
+    """Why TC only refused this shot, with EDIT frame ranges. The shot is not created."""
+    def frames(ts):
+        return _ranges([edit_first + t for t in ts])
+    parts = []
+    if not mapping.get('read'):
+        parts.append(_t('번인 TC를 한 프레임도 읽지 못함', 'no burn-in TC frame was read'))
+    else:
+        if mapping.get('gaps'):
+            parts.append(_t('판독 실패 구간(%d프레임 초과 또는 앞뒤 판독 불일치) EDIT %s',
+                            'unread runs (longer than %d frames, or between reads that disagree) at EDIT %s') % (
+                mapping.get('max_gap', TC_ONLY_MAX_GAP),
+                frames([t for a, b in mapping['gaps'] for t in range(a, b + 1)])))
+        if mapping.get('inconsistent'):
+            parts.append(_t('앞뒤와 맞지 않는 판독 EDIT %s', 'reads inconsistent with their neighbors at EDIT %s') %
+                         frames(mapping['inconsistent']))
+        if mapping.get('outside'):
+            parts.append(_t('플레이트 TC 범위 밖 판독 EDIT %s', 'reads outside the plate TC range at EDIT %s') %
+                         frames(mapping['outside']))
+    return _t('[%s] TC만: 번인 TC만으로 정할 수 없는 프레임이 있어 이 샷은 만들지 않았습니다 — %s. '
+              '추측으로 채우지 않습니다. 자동(이미지 + TC)으로 실행해 주세요.',
+              '[%s] TC only: some frames cannot be resolved from burn-in TC alone, so this shot was not created — %s. '
+              'Nothing is guessed. Run with Auto (image + TC) instead.') % (name, '; '.join(parts))
+
+
+def tc_only_slow_note():
+    return _t('TC만 모드는 정수 TC만 따르므로 보간 슬로우(프레임 사이 값)는 표현하지 못합니다. 정지와 역재생은 읽은 그대로 됩니다.',
+              'TC only follows whole-frame TC, so interpolated slow motion (in-between frames) cannot be represented. '
+              'Holds and reverse follow the read TC.')
 
 
 def tc_preflight_cache_key(edit_key, plate_key, fps, roi, tc_signature, color_signature):
@@ -14755,12 +15908,89 @@ def static_line_retry_accept(base, candidate, heldout):
     return True, 'strong_image_recovery'
 
 
+def _process_plate_tc_only(plate, E_lum, opts, ctx, excl, pin_frames, tcf, ef, tc_raw=None, region=None):
+    """TC only: each EDIT frame takes the plate frame whose timecode equals its burn-in TC.
+    Images never move a frame here. They are used only for geometry (optical / reframe), the match-similarity
+    check and QC. Returns (res, lo, timing) like _process_plate; raises RuntimeError when TC cannot decide."""
+    import time
+    log = ctx.log
+    pf, pl = plate.firstFrame(), plate.lastFrame()
+    E = E_lum.shape[0]
+    timing = {}
+    if opts.get('split'):
+        raise RuntimeError(_t('[%s] TC만 모드는 분할합성 모드에서 쓸 수 없습니다. 일반 모드로 실행해 주세요.',
+                              '[%s] TC only is not available in split-composite mode. Run in Standard mode.') % plate.name())
+    base = plate_tc_base(plate, pf, pl, log, allow_missing=True)
+    # A movie without a timecode track reads as 00:00:00:00 in Nuke, so a zero start that no file track
+    # confirmed is treated as no plate TC as well (TC priority can still recover a base from the image).
+    if not base or (len(base) > 2 and base[2]) or (len(base) == 2 and int(base[1]) == 0):
+        raise RuntimeError(tc_only_no_plate_tc_text(plate.name()))
+    if not tcf or not any(v is not None for v in tcf):
+        raise RuntimeError(tc_only_no_read_text(plate.name()))
+    max_speed = opts.get('max_speed', 16)
+    mapping = tc_only_map(tcf, base[1], pf, pl, max_speed=max_speed)
+    if not mapping['ok']:
+        raise RuntimeError(tc_only_failure_text(plate.name(), mapping, ef))
+    frames = list(mapping['frames'])
+    user = []
+    for fe, fp in (pin_frames or {}).items():  # explicit user pins still win over a read TC
+        t = fe - ef
+        if 0 <= t < E and pf <= fp <= pl:
+            frames[t] = int(fp)
+            user.append(t)
+    tcp = tc_plan(tcf, tc_raw, pf, pl, base[1], E)
+    tcp['fps'] = base[0]
+    if len(base) > 3:
+        tcp['b0_src'] = base[3]
+    log(_t('[%s] TC만: 판독 %d/%d프레임, 보간 %d, 가장자리 연장 %d, TC 점프 %d — 이미지 매칭으로 타이밍을 바꾸지 않음',
+           '[%s] TC only: %d/%d frames read, %d interpolated, %d edge-extended, %d TC jumps — image matching does not change timing') % (
+        plate.name(), mapping['read'], E, len(mapping['filled']), len(mapping['extended']), len(mapping['jumps'])))
+    log('[%s] %s' % (plate.name(), tc_only_slow_note()))
+    lo, hi = max(pf, min(frames) - 2), min(pl, max(frames) + 2)
+    ctx.progress(0.3, _t('[%s] 썸네일 %d-%d', '[%s] Thumbnails %d-%d') % (plate.name(), lo, hi))
+    _, secB = ensure_thumbs(plate, lo, hi, 1, W_PLATE, True, log)
+    timing['plate'] = secB
+    P_lum, p_ok = load_thumbs(plate, list(range(lo, hi + 1)), W_PLATE, log)
+    if identical_thumbs(P_lum, p_ok):
+        raise RuntimeError(_t('[%s] PLATE 썸네일 %d장이 전부 같은 그림입니다 — Read 의 frame range(first/last)가 한 프레임에 고정됐는지 확인해 주세요', '[%s] All %d PLATE thumbnails are identical — check whether the Read frame range (first/last) is fixed to one frame') % (plate.name(), int(p_ok.sum())))
+    if ctx.cancelled():
+        raise Cancelled()
+    ctx.progress(0.55, _t('[%s] 분석', '[%s] Analyzing') % plate.name())
+
+    def prog(i, n):
+        ctx.progress(0.6 + 0.35 * i / max(n, 1))
+        return ctx.cancelled()
+    path = np.asarray(frames, int) - lo
+    t_an = time.time()
+    # Every frame is a forced pin, so the solver only fits geometry and scores the picture along the TC path.
+    res = solve(E_lum, P_lum, P_valid_files=p_ok, max_speed=max_speed,
+                detect_optical=opts['optical'], allow_flop=opts['flop'], detect_slow_on=False,
+                log=log, progress=prog, detect_split=False, track=opts['track'], region=region, exclude=excl,
+                pins=dict((t, int(path[t])) for t in range(E)))
+    timing['analysis'] = time.time() - t_an
+    moved = int(np.sum(np.asarray(res['path'], int) != path))
+    if moved:
+        log('[%s] TC only: solver tail differed on %d frames; the TC path is kept' % (plate.name(), moved))
+    res.update(path=path.copy(), frac=path.astype(float), blended=np.zeros(E, bool), lookup=None, slow=[],
+               sub_spans=[], sub_diag=None, tnorm=None, near_hold=[], confidence_warn=[], tc_mismatch=[],
+               pins=dict((t, int(path[t])) for t in user),
+               cuts=[dict(t=int(t), jump=int(d), mismatch=0.0, tc=True) for t, d in mapping['jumps']],
+               reversals=direction_changes(path, np.asarray(res['E_valid'], bool) | np.asarray(excl, bool)),
+               tc_plan=dict((k, v) for k, v in tcp.items() if k not in ('pins_abs', 'hints_abs')),
+               tc=dict(mode=TC_MODE_ONLY, read=int(mapping['read']), filled=list(mapping['filled']),
+                       extended=list(mapping['extended']), jumps=[list(j) for j in mapping['jumps']],
+                       user_pins=len(user), solver_moved=moved, max_gap=int(mapping['max_gap'])))
+    return res, lo, timing
+
+
 def _process_plate(plate, E_lum, opts, ctx, excl, pin_frames, tcf, ef, tc_raw=None, region=None):
     """ one plate: range search -> render -> analysis. Returns (res, lo, timing)
     JobCtx, exclusion ranges, pins, lagging-TC hints. Stage 1 (stride) is skipped when TC is sufficient
     TC-first mode (tc_plan): confident TC as pin candidates (image veto / offset check happen inside solve)
     """
     import time
+    if tc_only_requested(opts):
+        return _process_plate_tc_only(plate, E_lum, opts, ctx, excl, pin_frames, tcf, ef, tc_raw, region=region)
     log = ctx.log
     pf, pl = plate.firstFrame(), plate.lastFrame()
     P_total = pl - pf + 1
@@ -15630,13 +16860,102 @@ def analysis_read_note(temp):
               'Color read: the edit has no color tag, so analysis read it as %s. Your Read, the result nodes and the QC view are unchanged.') % colorspace
 
 
-def process_job(edit, plates, opts, ctx, exclude_frames=(), pin_frames=None, edit_is_new=False):
-    """Own output nodes explicitly so cancellation cannot leave a partial job."""
+# Job block reservation: while a run is in progress its nodes are created at their final places
+# inside one reserved block (memory-only reservation, no backdrop until the result is final), never beside the user's Reads.
+JOB_PLATE_STEP = 760  # horizontal distance between the trees of several plates in one job
+JOB_BLOCK = (-260, -148, 720, 780)  # block extent around the first plate base (x0, y0, x1, y1); the real result graph ends at x 649 / y 645 (B pipe) or 730 (side branch) incl. the note
+JOB_BLOCK_BOTTOM = {'pipe': 720, 'branch': 780}  # measured result bottom + backdrop padding + slack, per Difference layout
+JOB_BLOCK_GAP = 24  # empty gap kept between the plate Read and the top of its result block
+JOB_TEMP_COLUMN = 200  # extra column on the right for temporary analysis nodes
+_JOB_LAYOUT = None
+
+
+def job_block_size(count):
+    x0, y0, x1, y1 = JOB_BLOCK
+    try:
+        y1 = JOB_BLOCK_BOTTOM[diff_layout_mode()]
+    except Exception:
+        pass
+    return x1 - x0 + JOB_PLATE_STEP * max(0, count - 1) + JOB_TEMP_COLUMN, y1 - y0
+
+
+def layout_xy(plate):
+    """Base position for a plate's result tree: its reserved slot during a job, else the plate itself."""
+    if _JOB_LAYOUT is not None:
+        for node, xy in _JOB_LAYOUT['bases']:
+            if node is plate:
+                return xy
+    return int(plate.xpos()), int(plate.ypos())
+
+
+def job_temp_slot(index):
+    """(x, y) for temporary analysis node #index inside the reserved block, or None outside a job."""
+    if _JOB_LAYOUT is None:
+        return None
+    x0, y0, x1, y1 = _JOB_LAYOUT['rect']
+    return int(x1 - JOB_TEMP_COLUMN + 40), int(y0 + 40 + 220 * index)
+
+
+def begin_job_layout(plates, log=print, extra_bottom=0, movable=()):
+    """Reserve free space for this job's block in memory only (no node, no backdrop). Returns the previous state.
+    extra_bottom adds room under the block for a QC review graph that stays in the result backdrop (Write-only mode).
+    movable: nodes this run created (new plate Reads, new edit Read). When the first plate is one of them, the block is
+    aligned to the row the plate stands on and those nodes are not obstacles, because they move into the block."""
+    global _JOB_LAYOUT
+    previous = _JOB_LAYOUT
+    try:
+        p0 = plates[0]
+        w, h = job_block_size(len(plates))
+        h += int(extra_bottom)
+        # The block starts right under the plate Read (where a result tree always ended up), so it never covers the
+        # plate itself and only moves when something else is in the way.
+        movable = [n for n in movable if n is not None]
+        if any(n is p0 for n in movable):
+            bx, by = int(p0.xpos()) + JOB_BLOCK[0], int(p0.ypos()) - LAY['edit'][1] + JOB_BLOCK[1]
+        else:
+            movable = []
+            bx, by = int(p0.xpos()) + JOB_BLOCK[0], int(_node_rect(p0)[3]) + JOB_BLOCK_GAP
+        dx, dy = place_free([], log=log, avoid_backdrops=True, rects=[(bx, by, bx + w, by + h)], ignore=movable)  # the block already holds the backdrop padding
+        x0, y0 = bx + dx, by + dy
+        bases = [(plate, (x0 - JOB_BLOCK[0] + JOB_PLATE_STEP * k, y0 - JOB_BLOCK[1]))
+                 for k, plate in enumerate(plates)]
+        rect = (x0, y0, x0 + w, y0 + h)
+        _RESERVED_RECTS.append(rect)
+        _JOB_LAYOUT = dict(bases=bases, rect=rect)
+    except Exception as error:
+        log(_t('결과 자리 예약 생략(결과는 플레이트 옆에 만듦): %s',
+               'Result block reservation skipped (results are built beside the plate): %s') % error)
+    return previous
+
+
+def end_job_layout(previous, log=print):
+    """Release the in-memory reservation; the caller's finalize_group draws the only backdrop at the end."""
+    global _JOB_LAYOUT
+    current, _JOB_LAYOUT = _JOB_LAYOUT, previous
+    if current is not None and current is not previous:
+        try:
+            _RESERVED_RECTS.remove(current['rect'])
+        except ValueError:
+            pass
+
+
+def process_job(edit, plates, opts, ctx, exclude_frames=(), pin_frames=None, edit_is_new=False, new_plates=()):
+    """Own output nodes explicitly so cancellation cannot leave a partial job.
+    new_plates: plate Reads this run created; they are placed in the result block next to the new edit Read."""
     owned_nodes = [edit] if edit_is_new else []
+    new_plates = [n for n in new_plates if any(n is plate for plate in plates)]
+    previous_layout = begin_job_layout(plates, ctx.log,
+                                       extra_bottom=QC_BUNDLE_RESERVE if opts.get('review') and qc_write_only(opts) else 0,
+                                       movable=new_plates + ([edit] if edit_is_new else []))
     analysis_edit, temp_read = acquire_analysis_read(edit, ctx.log)
+    if temp_read is not None and job_temp_slot(0) is not None:
+        try:
+            temp_read.setXYpos(*job_temp_slot(0))
+        except Exception:
+            pass
     try:
         result = _process_job_impl(edit, plates, opts, ctx, exclude_frames, pin_frames,
-                                   edit_is_new, owned_nodes, analysis_edit=analysis_edit)
+                                   edit_is_new, owned_nodes, analysis_edit=analysis_edit, new_plates=new_plates)
         result['_owned_nodes'] = list(owned_nodes)
         return result
     except Cancelled:
@@ -15657,10 +16976,11 @@ def process_job(edit, plates, opts, ctx, exclude_frames=(), pin_frames=None, edi
         raise
     finally:
         release_analysis_read(temp_read, ctx.log)
+        end_job_layout(previous_layout, ctx.log)
 
 
 def _process_job_impl(edit, plates, opts, ctx, exclude_frames, pin_frames, edit_is_new, owned_nodes,
-                      analysis_edit=None):
+                      analysis_edit=None, new_plates=()):
     """
     process 1 EDIT + n PLATEs -> create nodes. Returns dict(results, warn, notes)
     exclude_frames: set of EDIT frame numbers to exclude, pin_frames {EDIT frame: PLATE frame}
@@ -15695,7 +17015,7 @@ def _process_job_impl(edit, plates, opts, ctx, exclude_frames, pin_frames, edit_
     if ctx.cancelled():
         raise Cancelled()
     if identical_thumbs(E_lum, e_ok):  # an immediate error instead of a silently wrong result
-        raise RuntimeError(_t('EDIT 썸네일 %d장이 전부 같은 그림입니다 — Read 의 frame range(first/last)가 한 프레임에 고정됐는지 확인해 주세요 (스크립트로 만든 무비 Read). 정말 한 장짜리 정지 화면이면 고정점 하나로 지정해 주세요.', 'All %d EDIT thumbnails are identical — check whether the Read frame range (first/last) is fixed to one frame (movie Read created by a script). For a genuine single-frame hold, specify one anchor.') % int(e_ok.sum()))
+        raise RuntimeError(_t('EDIT 썸네일 %d장이 전부 같은 그림입니다 — Read 의 frame range(first/last)가 한 프레임에 고정됐는지 확인해 주세요 (스크립트로 만든 무비 Read). 정말 한 장짜리 정지 화면이면 고정점 하나로 지정해 주세요.', 'All %d EDIT thumbnails are identical — check whether the Read frame range (first/last) is fixed to one frame (movie Read created by a script). For a genuine single-frame hold, set one pin.') % int(e_ok.sum()))
     edit_duplicates = isolated_edit_duplicates(E_lum, e_ok)
     excl = np.array([f in set(exclude_frames or ()) for f in range(ef, el + 1)], bool)
     # fit-inside (pillarbox): if the active picture width is narrow, re-render only that area at the edit thumbnail resolution and match it
@@ -15724,19 +17044,67 @@ def _process_job_impl(edit, plates, opts, ctx, exclude_frames, pin_frames, edit_
     if edit_duplicates:
         warn.append(_t('EDIT (중복 프레임 의심 %s)', 'EDIT (possible duplicate frames %s)') % _ranges(ef + np.array(edit_duplicates)))
     warn_q, warn_conf, cuts = [], [], []  # match-quality warnings / suspected split cuts (warn gets both)
+    composites = []  # spatial split-screen composites (two clips in one frame)
     near_hold = []  # [(plate name, still segment, out_first)]
     qc_on = qc_required(opts)  # review / second-pass QC also need the final QC input
     edit_qc, edit_qc_first = None, None
     p0 = plates[0]
     if edit_is_new:  # a newly loaded edit goes in the left column of the PLATE
-        edit.setXYpos(p0.xpos() + LAY['edit'][0], p0.ypos() + LAY['edit'][1])
+        bx, by = layout_xy(p0)
+        edit.setXYpos(bx + edit_column_dx(p0.name(), edit.name()), by + LAY['edit'][1])
+    for plate in new_plates:  # plate Reads made for this run stand in their own result block, on the edit row
+        bx, by = layout_xy(plate)
+        plate.setXYpos(bx, by + LAY['edit'][1])
+    # Split composite with drawn regions: match every drawn part (and, with one region and two plates
+    # the rest of the frame) against every checked plate, then give each part its best plate.
+    split_parts, part_by_plate, part_cache = [], {}, {}
+    if opts.get('split') and opts.get('plate_regions') and len(plates) >= 2:
+        plate_ids = [node_stable_name(p) for p in plates]
+        split_parts = split_roi_parts(opts['plate_regions'], plate_ids)
+        if split_parts:
+            scores = {}
+            pre = ctx.sub(0.0, 0.05)
+            pre.a3_analysis_box = None
+            pre.a3_edit_aspect = edit.format().height() / float(edit.format().width())
+            for part in split_parts:
+                mask = split_part_mask(E_lum.shape[1:], part)
+                for plate, pid in zip(plates, plate_ids):
+                    log(_t('[분할합성 영역] %s → %s 검사', '[Split-composite region] checking %s against %s') % (
+                        part['key'], plate.name()))
+                    try:
+                        got = _process_plate(plate, E_lum, opts, pre, excl, pin_frames, None, ef, None, region=mask)
+                    except Cancelled:
+                        raise
+                    except Exception as e:
+                        log(_t('  검사 실패: %s', '  Check failed: %s') % e)
+                        continue
+                    part_cache[(part['key'], pid)] = got
+                    scores[(part['key'], pid)] = split_roi_score(got[0])
+            assign, drawn_kept = assign_split_parts(scores, split_parts, plate_ids)
+            for part in split_parts:
+                pid = assign.get(part['key'])
+                if pid is None:
+                    continue
+                part_by_plate[pid] = dict(part, plate=pid, drawn_kept=drawn_kept,
+                                          scores=dict((q, round(scores[(part['key'], q)], 4))
+                                                      for q in plate_ids if (part['key'], q) in scores))
+                log(_t('[분할합성 영역] %s → %s (점수 %s)', '[Split-composite region] %s → %s (scores %s)') % (
+                    part['key'], pid, ', '.join('%s %.4f' % kv for kv in part_by_plate[pid]['scores'].items())))
     span = 0.94 / len(plates)
     for i, plate in enumerate(plates):
         log('==== PLATE %s (%d/%d)' % (plate.name(), i + 1, len(plates)))
         sub = ctx.sub(0.05 + i * span, 0.05 + (i + 1) * span)
         plate_id = node_stable_name(plate)
-        roi_rect = (opts.get('plate_regions') or {}).get(plate_id)
-        plate_edit, region, plate_box = plate_analysis_inputs(E_lum, E_solve, box, roi_rect)
+        split_part = part_by_plate.get(plate_id)
+        if split_parts:
+            roi_rect = split_part['rect'] if split_part is not None else None
+            if split_part is not None:
+                plate_edit, region, plate_box = E_lum, split_part_mask(E_lum.shape[1:], split_part), None
+            else:
+                plate_edit, region, plate_box = plate_analysis_inputs(E_lum, E_solve, box, None)
+        else:
+            roi_rect = (opts.get('plate_regions') or {}).get(plate_id)
+            plate_edit, region, plate_box = plate_analysis_inputs(E_lum, E_solve, box, roi_rect)
         plate_ok = e_ok if roi_rect is not None else e_ok_solve
         tc_roi = (opts.get('plate_tc_rois') or {}).get(plate_id)
         proj = None
@@ -15771,11 +17139,18 @@ def _process_job_impl(edit, plates, opts, ctx, exclude_frames, pin_frames, edit_
                 log(_t('[%s] 렉TC 보정 없음 (%s) — TC 없이 진행', '[%s] No burn-in TC calibration (%s) — continue without TC') % (plate.name(), proj))
         sub.a3_analysis_box = plate_box
         sub.a3_edit_aspect = edit.format().height() / float(edit.format().width())
-        res, lo, timing = _process_plate(plate, plate_edit, opts, sub, excl, pin_frames,
-                                         tcf, ef, tc_raw, region=region)
+        cached = part_cache.get((split_part['key'], plate_id)) if split_part is not None and tcf is None else None
+        if cached is not None:
+            res, lo, timing = cached  # the region check above already solved this pair without TC
+        else:
+            res, lo, timing = _process_plate(plate, plate_edit, opts, sub, excl, pin_frames,
+                                             tcf, ef, tc_raw, region=region)
         if region is not None:
             res['manual_region_rect'] = tuple(roi_rect)
             res['manual_region_plate'] = plate_id
+        if split_part is not None:
+            res['split_roi'] = dict((k, split_part[k]) for k in
+                                    ('key', 'rect', 'invert', 'drawn_on', 'plate', 'drawn_kept', 'scores'))
         if tcf is not None:
             res['tc_preflight'] = tc_preflight_from_result(
                 tcf, plate.firstFrame(), plate.lastFrame(), res, lo)
@@ -15807,7 +17182,7 @@ def _process_job_impl(edit, plates, opts, ctx, exclude_frames, pin_frames, edit_
             warn_q.append(warn[-1])
         elif res.get('confidence_warn'):  # do not settle silently on a 'fair' match
             warn.append(_t('%s (일치도 %s, 신뢰도 낮음: %s)', '%s (matching similarity %s, low confidence: %s)') % (plate.name(), score_text(res['quality']),
-                                                       _report_detail_text(', '.join(res['confidence_warn']))))
+                                                       ', '.join(_report_detail_text(v) for v in res['confidence_warn'])))
             warn_q.append(warn[-1])
             warn_conf.append(warn[-1])
         out_first = first_frame_value(out_txt, plate.firstFrame(),
@@ -15815,6 +17190,9 @@ def _process_job_impl(edit, plates, opts, ctx, exclude_frames, pin_frames, edit_
         tci = res.get('tc') or {}
         if tci.get('mode') in ('offset', 'mismatch', 'increment_mismatch') or tci.get('forced') or tci.get('lowq_released'):
             warn.append('%s (%s)' % (plate.name(), tc_status(res)[0]))  # the case where TC was followed because the image was weak
+        if tci.get('mode') == TC_MODE_ONLY and (tci.get('filled') or tci.get('extended')):
+            warn.append(_t('%s (TC만: 보간 EDIT %s)', '%s (TC only: interpolated at EDIT %s)') % (
+                plate.name(), _ranges(ef + np.array(sorted(list(tci.get('filled') or []) + list(tci.get('extended') or []))))))
         if tci.get('mode') == 'first' and tc_summ:  # a jump TC is confident about -> merged into split-cut suspects
             res['cuts'] = merge_tc_cuts(res.get('cuts') or [], tc_summ.get('cuts') or [], tcf, res['path'])
         for c in res.get('cuts') or []:
@@ -15823,6 +17201,8 @@ def _process_job_impl(edit, plates, opts, ctx, exclude_frames, pin_frames, edit_
         if res.get('cuts'):
             warn.append(_t('%s (분절컷 의심 EDIT %s)', '%s (possible cut at EDIT frame(s) %s)') % (plate.name(), ', '.join(
                 str(ef + c['t']) for c in res['cuts'])))
+        if res.get('composite'):
+            composites.append(dict(plate=plate.name(), desc=composite_desc(res['composite'], ef, split_mode=bool(opts['split']))))
         nh = res.get('near_hold') or []  # only 'indistinguishable' warns, weak evidence / confirmed are info ( 'insufficient evidence' warns too)
         amb = [s for s in nh if _span_state(s) == 'ambiguous']
         uns = [s for s in nh if _span_state(s) == 'unsure']
@@ -15845,7 +17225,8 @@ def _process_job_impl(edit, plates, opts, ctx, exclude_frames, pin_frames, edit_
         created = build_nodes(edit, plate, res, lo, out_first, edit_qc if qc_on else None,
                               qc_anchor=p0, qc_index=i, out_node=opts.get('out_node') or 'timewarp',
                               reframe_output=beta.get('create', False), owned_nodes=owned_nodes,
-                              interpolation=opts.get('lookup_interpolation', 'linear'))
+                              interpolation=opts.get('lookup_interpolation', 'linear'),
+                              diff_layout=opts.get('diff_layout', 'pipe'))
         tr = qc_transform_node(created, beta=beta.get('create', False)) if qc_on else None
         t_look = time.time()
         plate_qc, qc_grade_node = configure_qc_look(created, tr, edit_qc if qc_on else None,
@@ -15853,11 +17234,16 @@ def _process_job_impl(edit, plates, opts, ctx, exclude_frames, pin_frames, edit_
         look_elapsed = time.time() - t_look
         if qc_grade_node is not None:
             owned_nodes.append(qc_grade_node)
-        try:  # timecode Text overlay at the end of the output tree
-            add_output_timecode(created, output_tree_tail(created, qc_grade_node), edit, plate, ef, lo, res,
-                                out_first, owned_nodes, log)
-        except Exception as error:
-            log(_t('[%s] 출력 TC 노드 생략: %s', '[%s] Output TC node skipped: %s') % (plate.name(), error))
+        if qc_on and opts.get('review_mp_tc', QC_MP_TC_DEFAULT):  # plate TC label on the QC branch only, after look alignment
+            try:
+                try:
+                    label_roi = secondary_qc_tc_roi(
+                        node_context(plate)[0] or node_context(edit)[0] or script_context()[0], tc_roi)
+                except Exception:
+                    label_roi = None
+                add_qc_plate_tc_label(created, edit, plate, res, out_first, opts, label_roi, owned_nodes, log)
+            except Exception as error:
+                log(_t('[%s] QC 브랜치 MP 라벨 생략: %s', '[%s] QC branch MP label skipped: %s') % (plate.name(), error))
         t_secondary = time.time()
         secondary = run_secondary_qc(plate_qc, edit_qc if qc_on else None, res, out_first, opts,
                                      log=log, cancelled=ctx.cancelled)
@@ -15883,8 +17269,6 @@ def _process_job_impl(edit, plates, opts, ctx, exclude_frames, pin_frames, edit_
                 n_all = len(look.get('fit_indices') or ()) + n_check
                 txt += _t('\n색 맞춤 %d프레임 중 %d프레임으로 확인', '\nColor match checked on %d of %d frames') % (
                     (n_all, n_check) if ui_language() == 'ko' else (n_check, n_all))
-        if res.get('output_tc'):
-            txt += _t('\n출력 TC 노드: %s', '\nOutput TC node: %s') % output_timecode_label(res['output_tc'], out_first).replace('\n', ' ')
         if opts.get('secondary_qc'):
             txt += _t('\n%s · 추가 렌더 %.1fs', '\n%s · additional render %.1fs') % (secondary_qc_note(secondary), time.time() - t_secondary)
         txt += _t('\n소요: PLATE 탐색 %.0fs / 렌더 %.0fs / 분석 %.0fs', '\nTime: PLATE search %.0fs / render %.0fs / analysis %.0fs') % (
@@ -15902,7 +17286,7 @@ def _process_job_impl(edit, plates, opts, ctx, exclude_frames, pin_frames, edit_
         if qc_on:  # node handles the QC review render continues with
             qc = dict(tw=created[0], tr=tr, plate_qc=plate_qc, qc_grade_node=qc_grade_node,
                       rr=next((n for n in created if _node_name_startswith(n, 'region_fit_')), None))
-        if opts.get('review') and opts.get('review_mp_tc'):
+        if opts.get('review') and opts.get('review_mp_tc', QC_MP_TC_DEFAULT):
             try:
                 project = node_context(plate)[0] or node_context(edit)[0] or script_context()[0]
                 res['review_tc_roi'] = secondary_qc_tc_roi(project, tc_roi)
@@ -15938,10 +17322,11 @@ def _process_job_impl(edit, plates, opts, ctx, exclude_frames, pin_frames, edit_
         _set(sn, 'tile_color', 0x202a34ff)
         _set(sn, 'note_font_color', 0xf2f5f8ff)
         owned_nodes.append(sn)
-        sn.setXYpos(plate.xpos() + LAY['report'][0], plate.ypos() + LAY['report'][1])
+        bx, by = layout_xy(plate)
+        sn.setXYpos(bx + LAY['report'][0], by + LAY['report'][1])
     ctx.progress(1.0, _t('완료', 'Complete'))
     return dict(results=results, warn=warn, notes=notes, coverage=cov, coverage_review=cov_review,
-                warn_quality=warn_q, warn_conf=warn_conf, cuts=cuts, edit=edit, ef=ef, occ=occ, tc=tc_summ, near_hold=near_hold,
+                warn_quality=warn_q, warn_conf=warn_conf, cuts=cuts, composites=composites, edit=edit, ef=ef, occ=occ, tc=tc_summ, near_hold=near_hold,
                 edit_duplicates=edit_duplicates, reframe_warn=reframe_warn,
                 input_preflights=input_preflights, _owned_nodes=list(owned_nodes))
 
@@ -16012,8 +17397,93 @@ def batch_plate_is_live(row):
         return False
 
 
+def batch_row_nodes_live(row):
+    """True while the row's PLATE Read, or the EDIT Read chosen for it, is still in the script."""
+    return batch_plate_is_live(row) or ('edit_ref' in row and _node_identity_is_live(row.get('edit_ref'), 'Read'))
+
+
 def batch_deleted_plate_status():
     return _t('실패 — PLATE Read 삭제됨', 'Failed — PLATE Read deleted')
+
+
+_BATCH_DELETED_STATUS_KO = '실패 — PLATE Read 삭제됨'
+_BATCH_DELETED_STATUSES = (_BATCH_DELETED_STATUS_KO, 'Failed — PLATE Read deleted')  # stored in the language of the moment
+
+
+def batch_row_display_live(row, busy):
+    """Liveness used only to redraw the batch table. While a run is active the Nuke scene is mid-execute and
+    allNodes() is not trustworthy from a UI event (for example the language switch), so a redraw must never
+    re-judge rows or overwrite their stored status: it trusts the state the run recorded when it started."""
+    if busy:
+        return str(row.get('status') or '') not in _BATCH_DELETED_STATUSES
+    return batch_plate_is_live(row)
+
+
+def batch_rows_to_run(rows):
+    """Rows a batch Run processes. Rows with an edit are all queued again (skipped, cancelled, failed, waiting).
+    When some rows already finished and others did not, only the unfinished ones run, so a restart after a
+    cancel or skip does not redo (and duplicate the nodes of) the finished shots."""
+    runnable = [r for r in rows if r.get('mov')]
+    pending = [r for r in runnable if not str(r.get('status') or '').startswith('완료')]
+    if pending and len(pending) < len(runnable):
+        return pending
+    return runnable
+
+
+def batch_drop_gone_rows(todo, log=print, on_row=None):
+    """Rows whose PLATE Read (or explicitly chosen EDIT Read) no longer exists leave the run list before it starts;
+    they stay in the table marked as failed. One log line says how many were excluded (a script switched with the
+    window open leaves such rows behind)."""
+    keep, gone = [], 0
+    for row in todo:
+        snapshot_batch_plate(row)
+        if not batch_plate_is_live(row):
+            row['status'] = batch_deleted_plate_status()
+        elif 'edit_ref' in row and not _node_identity_is_live(row.get('edit_ref'), 'Read'):
+            row['status'] = '실패 — 선택한 EDIT Read가 삭제됨'  # stored in Korean, translated when displayed
+        else:
+            keep.append(row)
+            continue
+        gone += 1
+        if on_row:
+            on_row(row)
+    if gone:
+        log(_singular(_t('없어진 노드 %d행 제외', '%d rows with deleted nodes excluded') % gone))
+    return keep
+
+
+def batch_done_counts(rows):
+    """(succeeded, needs review, skipped, failed) over the batch rows; rows never run are not counted"""
+    ok = review = skipped = failed = 0
+    for row in rows:
+        status = str(row.get('status') or '')
+        if status.startswith('완료'):
+            review, ok = (review + 1, ok) if row.get('review') else (review, ok + 1)
+        elif status.startswith('건너뜀') or status.startswith('Skipped'):
+            skipped += 1
+        elif status.startswith('실패') or status.startswith('Failed'):
+            failed += 1
+    return ok, review, skipped, failed
+
+
+def batch_result_report(rows, limit=12):
+    """Text of the end-of-batch result report dialog, '' when every row finished without a review reason.
+    One line per row that is not a clean success (review, failed, skipped, never run), in the current UI language."""
+    lines = []
+    for row in rows:
+        status = str(row.get('status') or '')
+        if status.startswith('완료') and not row.get('review'):
+            continue
+        name = row.get('shot') or batch_plate_display(row)[0]
+        lines.append('%s: %s' % (name, batch_display_status(status)))
+    if not lines:
+        return ''
+    clean = len(rows) - len(lines)
+    shown = lines[:limit]
+    if len(lines) > limit:
+        shown.append(_singular(_t('… 외 %d샷', '… and %d more shots') % (len(lines) - limit)))
+    return (_singular(_t('확인할 샷 (%d샷 중 %d샷은 문제없이 완료):\n  ', 'Shots to check (%d shots, %d finished cleanly):\n  ') %
+                      (len(rows), clean)) + '\n  '.join(shown))
 
 
 def batch_row_for(mp, log=print, tick=None):
@@ -16077,12 +17547,101 @@ def sync_batch_cell_widgets(tbl, rows, col, make, update):
         update(w, row)
 
 
+BATCH_GROUP_GAP = 60  # gap between per-shot result backdrops in a batch
+QC_BUNDLE_RESERVE = 520  # empty room kept under a batch grid for the QC review graph (Dots, shot Groups, AppendClip, Write)
+BATCH_BD_PAD = (40, 120, 40, 40)  # padding of the enclosing batch backdrop (left, top (label), right, bottom)
+
+
+def batch_shot_name(row):
+    """Shot name for batch labels: the path-template shot when the plate path is recognised, else the Read name."""
+    shot = row.get('shot') or ''
+    if not shot and row.get('mp') is not None:
+        try:
+            shot = node_context(row['mp'])[2] or ''
+        except Exception:
+            shot = ''
+    return shot or batch_plate_display(row)[0]
+
+
+def _group_rect(nodes):
+    """Graph rectangle of one result group: its backdrop when present, else the union of its nodes."""
+    nodes = [n for n in nodes if n is not None]
+    boards = [n for n in nodes if n.Class() == 'BackdropNode']
+    rects = [_node_rect(n) for n in (boards or nodes)]
+    return (min(r[0] for r in rects), min(r[1] for r in rects),
+            max(r[2] for r in rects), max(r[3] for r in rects))
+
+
+def arrange_batch_groups(groups, log=print, reserve_bottom=0):
+    """Line up per-shot result groups (nodes + their backdrop) in a tidy grid, in run order.
+
+    Every group is measured first; columns share the widest group of their column and rows the tallest
+    group of their row, so backdrops align and never overlap. The whole grid then moves as one block
+    to free space, with room left for the enclosing batch backdrop. reserve_bottom keeps extra empty room under the
+    grid for the QC review graph that is built right below the results afterwards."""
+    groups = [[n for n in g if n is not None] for g in groups]
+    groups = [g for g in groups if g]
+    if not groups:
+        return
+    rects = [_group_rect(g) for g in groups]
+    cols = max(1, int(math.ceil(math.sqrt(len(groups)))))
+    widths = [max(r[2] - r[0] for r in rects[c::cols]) for c in range(cols)]
+    heights = [max(r[3] - r[1] for r in rects[k:k + cols]) for k in range(0, len(groups), cols)]
+    x0, y0 = rects[0][0], rects[0][1]
+    for k, (g, r) in enumerate(zip(groups, rects)):
+        col, row = k % cols, k // cols
+        x = x0 + sum(widths[:col]) + BATCH_GROUP_GAP * col
+        y = y0 + sum(heights[:row]) + BATCH_GROUP_GAP * row
+        dx, dy = int(x - r[0]), int(y - r[1])
+        if dx or dy:
+            for n in g:
+                n.setXYpos(int(n.xpos()) + dx, int(n.ypos()) + dy)
+    pad = (BATCH_BD_PAD[0], BATCH_BD_PAD[1], BATCH_BD_PAD[2], BATCH_BD_PAD[3] + int(reserve_bottom))
+    place_free([n for g in groups for n in g], log=log, pad=pad, avoid_backdrops=True)
+
+
+def batch_elapsed_text(secs):
+    secs = max(0, int(round(secs)))
+    if secs < 60:
+        return _t('%d초', '%ds') % secs
+    if secs < 3600:
+        return _t('%d분 %02d초', '%dm %02ds') % (secs // 60, secs % 60)
+    return _t('%d시간 %02d분', '%dh %02dm') % (secs // 3600, secs % 3600 // 60)
+
+
+def finalize_batch_backdrop(nodes, shots, ok, secs):
+    """One backdrop around everything a batch made, behind the per-shot backdrops, with the total time."""
+    nodes = [n for n in nodes if n is not None]
+    if not nodes:
+        return None
+    rects = [_node_rect(n) for n in nodes]
+    x0, y0 = min(r[0] for r in rects) - BATCH_BD_PAD[0], min(r[1] for r in rects) - BATCH_BD_PAD[1]
+    x1, y1 = max(r[2] for r in rects) + BATCH_BD_PAD[2], max(r[3] for r in rects) + BATCH_BD_PAD[3]
+    import html
+    head = html.escape(_t('NMMR 배치 · %d샷 중 %d샷 완료' % (shots, ok),
+                          'NMMR Batch · %d of %d shots done' % (ok, shots)), quote=True)
+    total = html.escape(_t('총 %s', 'Total %s') % batch_elapsed_text(secs), quote=True)
+    stamp = __import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M')
+    bd = nuke.nodes.BackdropNode(xpos=x0, ypos=y0, bdwidth=x1 - x0, bdheight=y1 - y0,
+                                 label='<font color="#f2f5f8"><b>%s · %s</b>\n%s</font>' % (head, total, stamp),
+                                 note_font='Arial', note_font_size=40, note_font_color=0xffffffff,
+                                 tile_color=0x3a4450ff)
+    try:
+        bd['z_order'].setValue(-2)  # behind the per-shot backdrops (-1)
+    except Exception:
+        pass
+    return bd
+
+
 def run_batch(rows, opts, ctx, on_row=None, review_out=None):
     """ batch: create an edit Read per row -> process. Continue even if one shot fails
     if opts['review'], render all finished shots as one QC review (result is filled into the review_out dict)
     """
-    todo = [r for r in rows if r.get('mov')]
+    todo = batch_drop_gone_rows(batch_rows_to_run(rows), ctx.log, on_row)
+    near = batch_place_mode(opts.get('batch_place')) == 'near'  # results stay under their own plates: no grid, no batch backdrop
     batch_owned = []
+    batch_groups = []  # per-shot node groups (with their backdrop) for the batch layout
+    batch_start = time.time()
     top = 0.88 if opts.get('review') else 1.0  # leave the review render's share at the end of the progress
     for i, row in enumerate(todo):
         if ctx.cancelled():
@@ -16091,6 +17650,7 @@ def run_batch(rows, opts, ctx, on_row=None, review_out=None):
         sub = ctx.sub(top * i / float(len(todo)), top * (i + 1) / float(len(todo)))
         snapshot_batch_plate(row)
         row_name = batch_plate_display(row)[0]
+        shot_name = batch_shot_name(row)
         if not batch_plate_is_live(row):
             row['status'] = batch_deleted_plate_status()
             if on_row:
@@ -16117,9 +17677,10 @@ def run_batch(rows, opts, ctx, on_row=None, review_out=None):
                 owned = successful_owned_nodes(out)
                 backdrop = finalize_successful_owned(
                     owned,
-                    '%s  EDIT %s' % (row.get('shot') or row_name, os.path.basename(row['mov'])),
+                    '%s  EDIT %s' % (shot_name, os.path.basename(row['mov'])),
                     sub.log, result=out, qc_grade_requested=qc_look_requested(opts))
                 _register_owned(backdrop, owned)
+                batch_groups.append(list(owned))
                 for node in owned:
                     _register_owned(node, batch_owned)
                 return out
@@ -16129,47 +17690,52 @@ def run_batch(rows, opts, ctx, on_row=None, review_out=None):
             row['tc'] = st[0] if st else ''
             r0 = out['results'][0]['res']
             row['quality'] = r0.get('quality')
-            flag = ['일치도 ' + score_text(row['quality']), frame_accuracy_text(r0, korean=True)]
-            if r0.get('confidence_warn'):
-                flag.append('신뢰도 낮음(%s)' % ', '.join(r0['confidence_warn']))
-            if r0.get('lowq'):
-                flag.append('확인 %d프레임' % len(r0['lowq']))
-            if r0.get('tc_mismatch'):
-                flag.append('TC 불일치 %d' % len(r0['tc_mismatch']))
-            if row['tc']:
-                flag.append(row['tc'])
-            if out.get('cuts'):
-                flag.append('분절컷 의심 EDIT %s' % ', '.join(str(c['edit_frame']) for c in out['cuts']))
-            nhf = near_hold_batch_flag(r0.get('near_hold') or [], out['results'][0]['out_first'])
-            if nhf:
-                flag.append(nhf)
-            beta = r0.get('reframe_output_beta') or {}
-            if beta.get('requested') and not beta.get('create'):
-                flag.append('Beta 출력 보류')
-            elif beta.get('review'):
-                flag.append('Beta 출력 검토 필요')
-            secondary_flag = secondary_qc_batch_flag(r0.get('secondary_qc'))
-            if secondary_flag:
-                flag.append(secondary_flag)
-            row['cuts'] = out.get('cuts') or []
-            reasons = shot_review_reasons(r0)  # same decision as the backdrop and note
-            row['review'] = bool(reasons)
-            extra = [_result_reason(k) for k in reasons if k not in _BATCH_SHOWN_REASONS]
-            if extra:
-                flag.append(_t('검토: ', 'Review: ') + ', '.join(extra))
+            with _korean_scope():  # stored in Korean; the table translates it for display
+                flag = ['일치도 ' + score_text(row['quality']), frame_accuracy_text(r0, korean=True)]
+                if r0.get('confidence_warn'):
+                    flag.append('신뢰도 낮음(%s)' % ', '.join(r0['confidence_warn']))
+                if r0.get('lowq'):
+                    flag.append('확인 %d프레임' % len(r0['lowq']))
+                if r0.get('tc_mismatch'):
+                    flag.append('TC 불일치 %d' % len(r0['tc_mismatch']))
+                st_ko = tc_status(r0)
+                row['tc'] = st_ko[0] if st_ko else ''
+                if row['tc']:
+                    flag.append(row['tc'])
+                if out.get('cuts'):
+                    flag.append('분절컷 의심 EDIT %s' % ', '.join(str(c['edit_frame']) for c in out['cuts']))
+                nhf = near_hold_batch_flag(r0.get('near_hold') or [], out['results'][0]['out_first'])
+                if nhf:
+                    flag.append(nhf)
+                beta = r0.get('reframe_output_beta') or {}
+                if beta.get('requested') and not beta.get('create'):
+                    flag.append('Beta 출력 보류')
+                elif beta.get('review'):
+                    flag.append('Beta 출력 검토 필요')
+                secondary_flag = secondary_qc_batch_flag(r0.get('secondary_qc'))
+                if secondary_flag:
+                    flag.append(secondary_flag)
+                row['cuts'] = out.get('cuts') or []
+                reasons = shot_review_reasons(r0)  # same decision as the backdrop and note
+                row['review'] = bool(reasons)
+                extra = [_result_reason(k) for k in reasons if k not in _BATCH_SHOWN_REASONS]
+                if extra:
+                    flag.append(_t('검토: ', 'Review: ') + ', '.join(extra))
             row['status'] = '완료' + (' — ' + ', '.join(flag) if flag else '')
         except Cancelled as e:
             row['status'] = '건너뜀' + (' — %s' % e if str(e) else '')
         except Exception as e:
             if ctx.cancelled():  # the RuntimeError of nuke.execute stopped by cancel = cancel
-                row['status'] = '건너뜀 — %s' % _t('취소', 'Cancelled')
+                row['status'] = '건너뜀 — 취소'  # stored in Korean; batch_display_status localizes the detail
                 if on_row:
                     on_row(row)
                 continue
             import traceback
             traceback.print_exc()
-            finalize_failed_owned(e, '%s  EDIT %s' % (
-                row.get('shot') or row_name, os.path.basename(row['mov'])), sub.log)
+            failed_bd = finalize_failed_owned(e, '%s  EDIT %s' % (
+                shot_name, os.path.basename(row['mov'])), sub.log)
+            if failed_bd is not None:
+                batch_groups.append(process_error_owned_nodes(e) + [failed_bd])
             row['status'] = '실패 — %s' % e
         if on_row:
             on_row(row)
@@ -16177,13 +17743,32 @@ def run_batch(rows, opts, ctx, on_row=None, review_out=None):
     for row in todo:  # all finished shots -> one QC review
         o = row.pop('_out', None)
         if o is not None and row['status'].startswith('완료'):
-            ents += review_entries(o, row.get('shot') or batch_plate_display(row)[0])
+            ents += review_entries(o, batch_shot_name(row))
+    try:
+        if not near:
+            arrange_batch_groups(batch_groups, ctx.log,
+                                 reserve_bottom=QC_BUNDLE_RESERVE if opts.get('review') and ents else 0)
+    except Exception as error:
+        ctx.log(_t('배치 결과 정렬 실패(결과는 정상): %s', 'Could not arrange batch results (results are valid): %s') % error)
+    enclosed = [n for g in batch_groups for n in g]
     if opts.get('review') and not ctx.cancelled():
-        rv = make_review(ents, opts, ctx.sub(top, 1.0), batch_owned)
+        # Near the plates: the review follows the first shot (its results are the only ones not scattered by later shots)
+        rv = make_review(ents, opts, ctx.sub(top, 1.0), batch_groups[0] if near and batch_groups else batch_owned, batch=True)
         for node in rv.get('_owned_nodes') or ():
             _register_owned(node, batch_owned)
+            enclosed.append(node)
+        read = nuke.toNode(rv['read']) if rv.get('read') else None
+        if read is not None:
+            enclosed.append(read)
         if review_out is not None:
             review_out.update(rv)
+    if batch_groups and not near:
+        try:
+            done = sum(1 for r in todo if str(r.get('status', '')).startswith('완료'))
+            _register_owned(finalize_batch_backdrop(enclosed, len(todo), done, time.time() - batch_start),
+                            batch_owned)
+        except Exception as error:
+            ctx.log(_t('배치 전체 백드롭 생성 실패(결과는 정상): %s', 'Could not create the batch backdrop (results are valid): %s') % error)
     if review_out is not None:
         review_out['_owned_nodes'] = list(batch_owned)
     return rows
@@ -16199,7 +17784,13 @@ QC_WARN_RGB = (1.0, 0.68, 0.25)
 QC_PREF_MP = ('BL', 'TL', 'BR', 'TR')  # if there is no burn-in, prefer the left (the edit TC is usually on the right)
 QC_PREF_SHOT = ('TL', 'BL', 'TR', 'BR')
 QC_OCC_TIE = 0.05  # same grade in 5% occupancy steps (ignore a few residual pixels at the edge) - the same grade is decided by preference order
-QC_COLS = 10  # node graph grid: shot columns per row
+QC_COLS = 10  # node graph grid: at most this many shot blocks per row (the count is chosen by area)
+QC_ROW_STEP = 34  # node graph row pitch inside a QC review shot block (two-line Reformat tile = 32)
+QC_DOT_STEP = 22  # row pitch between staggered entrance Dots (a Dot label is about 14 px tall)
+QC_COL_GAP = 24  # gap between estimated node footprints of neighbouring columns
+QC_BLOCK_GAP = 48  # gap between shot blocks and between block rows
+QC_MAX_ASPECT = 2.5  # preferred widest width:height of the whole QC grid
+QC_INFO_OPACITY = 0.62  # QC review information panel background opacity (Group knob default)
 QC_JPEG_CHUNK = 24  # JPEG render progress update unit (frames)
 
 
@@ -16253,8 +17844,9 @@ def qc_review_layout(W, H, opts, tc_roi=None):
     tc = (x0 * W, (1 - y1) * H, x1 * W, (1 - y0) * H)
     factor = min(200., max(50., float(opts.get('review_mp_size', QC_MP_SIZE_DEFAULT)))) / 100.
     # Match 11 TC characters to ROI width; MP prefix extends left, digits align right.
-    mp_size = max(8., min((tc[3] - tc[1]) * .75, (tc[2] - tc[0]) / (11 * .80))) * factor
-    mp_size = min(mp_size, (W - 2 * margin - 2 * pad) / (16 * .80))
+    mp_base = max(8., min((tc[3] - tc[1]) * .75, (tc[2] - tc[0]) / (11 * .80)))
+    mp_cap = (W - 2 * margin - 2 * pad) / (16 * .80)
+    mp_size = min(mp_base * factor, mp_cap)
     width, height = math.ceil(mp_size * 16 * .80) + 2 * pad, math.ceil(mp_size * 1.5) + 2 * pad
     position = opts.get('review_mp_position', 'above_tc')
     relation = position
@@ -16274,7 +17866,7 @@ def qc_review_layout(W, H, opts, tc_roi=None):
     bottom = min(max(bottom, 0), H - height)
     return dict(info=info, mp=(left, bottom, left + width, bottom + height),
                 tc=tc, tc_known=known, relation=relation, size=size, mp_size=mp_size,
-                pad=pad, line=line)
+                pad=pad, line=line, W=W, H=H, margin=margin, mp_base=mp_base, mp_cap=mp_cap)
 
 
 def burnin_occupancy(E_lum, results, roi=None):
@@ -16343,31 +17935,154 @@ def pick_corner(occ, w, h, W, H, m, pref, taken=()):
     return best[1:]
 
 
+# Font folders differ from system to system. When the fixed paths below are absent the font folders are searched
+# by file name, and the last resort is the monospace Type 1 fonts every Nuke install ships, so the label text
+# always has a font file.
+QC_LINUX_FONT_DIRS = ('/usr/share/fonts', '/usr/local/share/fonts', '/usr/share/X11/fonts')
+QC_MONO_LINUX = ('DejaVuSansMono.ttf', 'LiberationMono-Regular.ttf', 'NotoSansMono-Regular.ttf',
+                 'FreeMono.ttf', 'UbuntuMono-R.ttf')
+QC_MONO_BOLD_LINUX = ('DejaVuSansMono-Bold.ttf', 'LiberationMono-Bold.ttf', 'NotoSansMono-Bold.ttf',
+                      'FreeMonoBold.ttf', 'UbuntuMono-B.ttf')
+QC_MONO_NUKE = ('Courier10Pitch.pfb', 'Courier.pfa')  # <Nuke>/plugins/fonts
+QC_MONO_BOLD_NUKE = ('Courier10PitchBold.pfb', 'CourierBold.pfa')
+
+
+_QC_FONT_FOUND = {}
+
+
+def _qc_font_find(names, dirs=QC_LINUX_FONT_DIRS):
+    """First existing file with one of `names` (in that order) under `dirs`, searched recursively; None if none.
+    The answer is kept for the session (a QC build asks several times)."""
+    key = (tuple(names), tuple(dirs))
+    hit = _QC_FONT_FOUND.get(key)
+    if hit is not None and os.path.exists(hit):
+        return hit
+    found = {}
+    for top in dirs:
+        if not os.path.isdir(top):
+            continue
+        for root, _dirs, files in os.walk(top):
+            for f in files:
+                if f in names and f not in found:
+                    found[f] = os.path.join(root, f)
+    hit = next((found[n] for n in names if n in found), None)
+    if hit is not None:
+        _QC_FONT_FOUND[key] = hit
+    return hit
+
+
+def _qc_nuke_font_dirs():
+    """Font folders of the running Nuke (plugins/fonts next to the executable, and on the plugin path)."""
+    out = []
+    try:
+        import nuke as _nk_mod
+        exe = getattr(_nk_mod, 'EXE_PATH', '') or ''
+        if exe:
+            out.append(os.path.join(os.path.dirname(exe), 'plugins', 'fonts'))
+        for p in (_nk_mod.pluginPath() or ()):
+            out.append(os.path.join(p, 'fonts'))
+    except Exception:
+        pass
+    return [d for d in out if os.path.isdir(d)]
+
+
+# Text2 stores a font by name (family + style), so the script opens on a machine that lacks the font file the
+# author used. The legacy Text node stores a file path, which another machine may not have: it draws nothing there.
+# macOS uses its own Menlo; elsewhere DejaVu Sans Mono when listed, else the Courier 10 Pitch shipped with Nuke.
+QcFont = namedtuple('QcFont', 'family style')
+QC_FONT_MONO_SYSTEM = 'Menlo'
+QC_FONT_MONO_BUNDLED = 'Courier 10 Pitch'
+QC_FONT_MONO_PORTABLE = 'DejaVu Sans Mono'  # elsewhere: the family closest to Menlo, when the host lists it
+QC_STYLES_REGULAR = ('Regular', 'Book')  # a family lists its normal weight under either name
+QC_FONT_CJK_SYSTEM = ('Apple SD Gothic Neo',)
+QC_FONT_CJK_OTHER = ('Malgun Gothic', 'NanumGothic', 'Nanum Gothic')
+_QC_FONT_TABLE = []  # one entry once nuke.getFonts() has answered: a set of (family, style)
+_QC_TEXT2_FAILED = []  # non-empty once creating a Text2 node raised: the legacy Text path is used from then on
+
+
+def _qc_font_table():
+    """Set of (family, style) that nuke.getFonts() lists; kept for the session. Empty where the host lacks the call."""
+    if not _QC_FONT_TABLE:
+        try:
+            found = set((str(f[0]), str(f[1])) for f in nuke.getFonts())
+        except Exception:
+            return set()
+        if found:
+            _QC_FONT_TABLE.append(found)
+        return found
+    return _QC_FONT_TABLE[0]
+
+
+def _qc_font_has(family, style):
+    return (family, style) in _qc_font_table()
+
+
+def _qc_text2_ok():
+    """True where the Text2 path is used: the host has the font list and Text2 creation has not failed."""
+    return nuke is not None and not _QC_TEXT2_FAILED and bool(_qc_font_table())
+
+
+def _qc_font_pick(kind, bold=False):
+    """(family, style) exactly as the host lists it, or None (the node's own default font is then left alone).
+    kind 'mono': Menlo on macOS, elsewhere DejaVu Sans Mono; then the bundled Courier 10 Pitch.
+    kind 'cjk': a Hangul family. Italic styles are never picked."""
+    styles = ('Bold',) if bold else QC_STYLES_REGULAR
+    mac = sys.platform == 'darwin'
+    if kind == 'cjk':
+        families = QC_FONT_CJK_SYSTEM if mac else QC_FONT_CJK_OTHER
+    else:
+        families = ((QC_FONT_MONO_SYSTEM if mac else QC_FONT_MONO_PORTABLE), QC_FONT_MONO_BUNDLED)
+    for family in families:
+        style = next((x for x in styles if _qc_font_has(family, x)), None)
+        if style is not None:
+            return QcFont(family, style)
+    return None
+
+
 def _qc_fonts():
-    """ (monospace, Hangul) font files - None if absent (default font / English warning text)"""
+    """(monospace, Hangul) fonts: QcFont (family, style) when Text2 is used, else font file paths (legacy Text).
+    None where absent (node default font / English warning text)."""
+    if _qc_text2_ok():
+        return _qc_font_pick('mono'), _qc_font_pick('cjk')
+    return _qc_legacy_fonts()
+
+
+def _qc_legacy_fonts():
+    """ (monospace, Hangul) font files - None if absent (default font / English warning text)
+    The monospace font falls back to the monospace fonts shipped with Nuke, so the TC text always has a font."""
     def first(paths):
         return next((p for p in paths if os.path.exists(p)), None)
     mono = first(['/System/Library/Fonts/Menlo.ttc',
                   'C:/Windows/Fonts/consola.ttf', '/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf'])
+    if mono is None and sys.platform.startswith('linux'):
+        mono = _qc_font_find(QC_MONO_LINUX)
+    if mono is None:
+        mono = _qc_font_find(QC_MONO_NUKE, _qc_nuke_font_dirs())
     cjk = first(['/System/Library/Fonts/AppleSDGothicNeo.ttc', 'C:/Windows/Fonts/malgun.ttf',
                  '/usr/share/fonts/truetype/nanum/NanumGothic.ttf'])
     return mono, cjk
 
 
 QC_MP_SIZE_DEFAULT = 125  # MP TC label size % default (range 50-200)
+QC_MP_TC_DEFAULT = True  # plate TC (MP) label on by default; a saved choice keeps its value
 QC_MP_OPACITY_DEFAULT = 100  # MP TC label background opacity % (text is always opaque)
 QC_MP_WEIGHT_DEFAULT = 'bold'
 
 
 def qc_mp_opacity(opts):
     """ background opacity 0-1 (an invalid value gives the default 100 %)"""
+    return qc_mp_opacity_percent(opts) / 100.
+
+
+def qc_mp_opacity_percent(opts):
+    """Background opacity in percent, clamped to 0-100 (an invalid value gives the default)."""
     try:
         value = float(opts.get('review_mp_opacity', QC_MP_OPACITY_DEFAULT))
     except (TypeError, ValueError):
         value = QC_MP_OPACITY_DEFAULT
     if value != value:
         value = QC_MP_OPACITY_DEFAULT
-    return min(100., max(0., value)) / 100.
+    return min(100., max(0., value))
 
 
 QC_MP_LOW_OPACITY = 0.40  # if the background opacity is below this, MP text becomes yellow + black outline (legible over a dark Difference)
@@ -16385,6 +18100,12 @@ def qc_mp_weight(opts):
 def _qc_mp_font(opts, mono, log):
     """ MP label font. Bold = bold monospace (macOS Menlo Bold is face index 1 of Menlo.ttc, so specified as (path, index),
     Windows consolab.ttf, Linux DejaVuSansMono-Bold.ttf). If absent, the existing monospace font + one log line"""
+    if _qc_text2_ok():
+        bold = qc_mp_weight(opts) == 'bold'
+        font = _qc_font_pick('mono', bold)
+        if font is None and bold:
+            log(_t('굵은 고정폭 글꼴을 찾지 못해 MP 라벨은 보통 글꼴로 표시합니다', 'Bold monospace font not found - MP label uses the regular font'))
+        return font or mono
     if qc_mp_weight(opts) == 'regular':
         return mono
     if os.path.exists('/System/Library/Fonts/Menlo.ttc'):
@@ -16392,6 +18113,11 @@ def _qc_mp_font(opts, mono, log):
     for path in ('C:/Windows/Fonts/consolab.ttf', '/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf'):
         if os.path.exists(path):
             return path
+    path = _qc_font_find(QC_MONO_BOLD_LINUX) if sys.platform.startswith('linux') else None
+    if path is None and (mono is None or os.path.basename(str(mono)) in QC_MONO_NUKE):
+        path = _qc_font_find(QC_MONO_BOLD_NUKE, _qc_nuke_font_dirs())  # bold twin of Nuke's own monospace
+    if path is not None:
+        return path
     log(_t('굵은 고정폭 글꼴을 찾지 못해 MP 라벨은 보통 글꼴로 표시합니다', 'Bold monospace font not found - MP label uses the regular font'))
     return mono
 
@@ -16439,13 +18165,72 @@ def review_for_job(out, shot, opts, ctx, anchors=None):
     return make_review(review_entries(out, shot), opts, ctx, anchors)
 
 
+QC_FOLDER_NAME = 'retime_QC_reviews'  # default QC folder beside the saved .nk (earlier versions used 'qc_review'; existing folders are left untouched)
+
+
+def qc_write_only(opts):
+    """True when the QC review should only build its Write graph (for a render farm) instead of rendering now."""
+    return str(opts.get('review_render', 'now')).lower() == 'write'
+
+
+def _review_path_key(path):
+    """Compare paths the way a render would: one separator style, and every frame-number pattern (####, %04d, %d)
+    folded to '#', since Nuke stores a typed .####.jpg as .%04d.jpg."""
+    text = str(path or '').strip().replace('\\', '/')
+    return re.sub(r'%0?\d*d|#+', '#', text)
+
+
+def _script_write_paths():
+    """Normalized file paths of every Write node in the script (QC Writes included), so a Write-only run that has
+    not rendered yet still counts as taken."""
+    paths = set()
+    try:
+        for n in nuke.allNodes('Write', recurseGroups=True):  # positional 2nd arg is the group, not recurse
+            try:
+                value = str(n['file'].value()).strip().replace('\\', '/')
+            except Exception:
+                continue
+            if value:
+                paths.add(_review_path_key(value))
+    except Exception:
+        pass
+    return paths
+
+
+def _unique_review_tag(kind, custom, tag, temp_path=None):
+    """Append _2, _3, ... to the time tag while the review output it names already exists (on disk or as the file
+    of a Write node already in the script), so a second run in the same minute never points at (and a farm render
+    never overwrites) an earlier review. An explicit file or sequence path typed by the user is left as typed."""
+    low = (custom or '').strip().lower()
+    if (kind == 'mov' and low.endswith('.mov')) or (kind == 'jpeg' and '#' in low):
+        return tag
+    n, cand = 1, tag
+    taken = _script_write_paths()
+    while True:
+        path = review_out_path(kind, custom, cand, temp_path)
+        if _review_path_key(path) in taken:
+            n += 1
+            cand = '%s_%d' % (tag, n)
+            continue
+        if kind == 'jpeg' and low:
+            exists = bool(_review_jpegs(path))
+        elif kind == 'jpeg':
+            exists = os.path.exists(os.path.dirname(path))  # default layout: one subfolder per run
+        else:
+            exists = os.path.exists(path)
+        if not exists:
+            return cand
+        n += 1
+        cand = '%s_%d' % (tag, n)
+
+
 def review_out_path(kind, custom, tag, temp_path=None):
-    """ save path. Default = qc_review/ next to the script (a temp folder if the script is unsaved)
+    """ save path. Default = retime_QC_reviews/ next to the script (a temp folder if the script is unsaved)
     MOV: <folder>/<name>.mov, JPEG: <folder>/<name>/<name>.####.jpg. If custom is given, use that folder / file"""
     rn = nuke.root().name()
     stem = os.path.splitext(os.path.basename(rn))[0] if rn and rn != 'Root' else 'untitled'
     base = '%s_qc_%s' % (stem, tag)
-    folder = os.path.join(os.path.dirname(rn), 'qc_review') if rn and rn != 'Root' else \
+    folder = os.path.join(os.path.dirname(rn), QC_FOLDER_NAME) if rn and rn != 'Root' else \
         temp_storage_path('reviews', temp_path)
     custom = (custom or '').strip()
     if custom:
@@ -16468,23 +18253,150 @@ def _qc_rect_node(inp, rect, rgb, opacity, name, owned_nodes=None):
     rc['area'].setValue(list(rect))
     rc['color'].setValue(list(rgb) + [1.0])
     _set(rc, 'opacity', opacity)
+    # A fit Reformat leaves the bbox on the picture only (letterbox / pillarbox); overlays must not be
+    # clipped to it. Inside the format the pixels are the same either way.
+    _set(rc, 'cliptype', 'no clip')
     return rc
 
 
+def _qc_is_text2(node):
+    try:
+        return node.Class() == 'Text2'
+    except Exception:
+        return False
+
+
+def _qc_size_knob(node):
+    """The knob that sets the glyph size: Text2 scales a 100 px base (global_font_scale = size / 100), Text has size."""
+    return 'global_font_scale' if _qc_is_text2(node) else 'size'
+
+
+def _qc_size_expr(node, expr):
+    """Expression for the size knob of node: `expr` is in pixels (the legacy Text unit)."""
+    return '(%s)/100' % expr if _qc_is_text2(node) else expr
+
+
+def _qc_new_text(name, owned_nodes):
+    """Text2 node (font by name); the legacy Text node where Text2 is unavailable or creation fails."""
+    if _qc_text2_ok():
+        try:
+            return _register_owned(nuke.nodes.Text2(name=_uname(name)), owned_nodes)
+        except Exception:
+            _QC_TEXT2_FAILED.append(True)
+    return _register_owned(nuke.nodes.Text(name=_uname(name)), owned_nodes)
+
+
+def _qc_text2_creatable():
+    """True when _qc_new_text will make a Text2 node. A throwaway Text2 is created (and deleted) to find out, so a
+    decision that depends on the node class is not taken before a failing creation switches to legacy Text."""
+    if not _qc_text2_ok():
+        return False
+    try:
+        probe = nuke.nodes.Text2()
+    except Exception:
+        _QC_TEXT2_FAILED.append(True)
+        return False
+    try:
+        nuke.delete(probe)
+    except Exception:
+        pass
+    return True
+
+
+# Text2 labels keep no font name in the saved script: the font knob carries DO_NOT_WRITE, so the script loads with the
+# Text2 default (Utopia, shipped with Nuke) and never reports a missing font. The node's onCreate (run on script open
+# and paste, not stored as a flag) sets the flag again and picks the font from the opening machine's nuke.getFonts
+# with the same rules as _qc_font_pick; MP label nodes take the weight from the nearest enclosing mp_weight knob.
+# Pure nuke, no engine import; never sets a name the host does not list; a font knob setValue(family, style) inside
+# a callback applies and then raises, so the font is set from its script form.
+QC_TEXT2_ON_CREATE = """try:
+    import sys
+    n = nuke.thisNode()
+    k = n['font']
+    k.setFlag(nuke.DO_NOT_WRITE)
+    kind, bold = @KIND@, @BOLD@
+    if n.name().split('_ol')[0] in ('mp_prefix', 'mp_tc'):
+        p = n.fullName()
+        while '.' in p:
+            p = p.rsplit('.', 1)[0]
+            g = nuke.toNode('root.' + p)
+            if g is not None and 'mp_weight' in g.knobs():
+                bold = int(g['mp_weight'].getValue()) == 0
+                break
+    mac = sys.platform == 'darwin'
+    fams = () if kind is None else (@CJK_MAC@ if mac else @CJK_OTHER@) if kind == 'cjk' else (@MONO_MAC@ if mac else @MONO_OTHER@)
+    sts = ('Bold',) if bold else @REGULAR@
+    fl = dict(((str(f[0]), str(f[1])), (str(f[2]).replace('\\\\', '/').split('/')[-1], int(f[3]))) for f in nuke.getFonts())
+    for fam in fams:
+        st = [s for s in sts if (fam, s) in fl][:1]
+        if st:
+            k.fromScript('{ %s : %s : %s : %d }' % ((fam, st[0]) + fl[(fam, st[0])]))
+            break
+except Exception:
+    pass
+"""
+
+
+def qc_text2_on_create(font):
+    """onCreate code for a Text2 the tool made with QcFont `font` (see QC_TEXT2_ON_CREATE).
+    With font None the code only keeps the font knob out of the saved script: the node stays on its default font."""
+    kind = None if font is None else 'cjk' if font.family in QC_FONT_CJK_SYSTEM + QC_FONT_CJK_OTHER else 'mono'
+    code = QC_TEXT2_ON_CREATE
+    for key, value in (('@KIND@', kind), ('@BOLD@', font is not None and font.style == 'Bold'),
+                       ('@CJK_MAC@', QC_FONT_CJK_SYSTEM), ('@CJK_OTHER@', QC_FONT_CJK_OTHER),
+                       ('@MONO_MAC@', (QC_FONT_MONO_SYSTEM, QC_FONT_MONO_BUNDLED)),
+                       ('@MONO_OTHER@', (QC_FONT_MONO_PORTABLE, QC_FONT_MONO_BUNDLED)),
+                       ('@REGULAR@', QC_STYLES_REGULAR)):
+        code = code.replace(key, repr(value))
+    return code
+
+
+def _qc_text2_set_font(t, font):
+    """Set a listed font on a new Text2 and keep its name out of the saved script (QC_TEXT2_ON_CREATE).
+    Every Text2 the tool makes gets the flag and the callback, also one whose font this host does not list (it
+    keeps the node default here): a font name set on it later is then not written either, and the machine that
+    opens the script picks by the same rules."""
+    font = font if isinstance(font, QcFont) else None
+    if font is not None and _qc_font_has(font.family, font.style):  # never a name the host lacks
+        t['font'].setValue(font.family, font.style)
+    try:
+        t['font'].setFlag(getattr(nuke, 'DO_NOT_WRITE', 0x200))
+        t['onCreate'].setValue(qc_text2_on_create(font))
+    except Exception:
+        pass
+
+
+def _qc_legacy_font(font):
+    """A font file for the legacy Text node from a QcFont (or the value unchanged)."""
+    if not isinstance(font, QcFont):
+        return font
+    mono, cjk = _qc_legacy_fonts()
+    if font.family in QC_FONT_CJK_SYSTEM + QC_FONT_CJK_OTHER:
+        return cjk
+    return _qc_mp_font({'review_mp_weight': font.style.lower()}, mono, lambda *_: None)
+
+
 def _qc_text_node(inp, msg, box, left, top, size, rgb, font, name, owned_nodes=None):
-    t = _register_owned(nuke.nodes.Text(name=_uname(name)), owned_nodes)
+    t = _qc_new_text(name, owned_nodes)
     t.setInput(0, inp)
     t['message'].setValue(msg)
     t['box'].setValue(list(box))
     _set(t, 'xjustify', 'left' if left else 'right')
     _set(t, 'yjustify', 'top' if top else 'bottom')
-    t['size'].setValue(size)
+    if _qc_is_text2(t):
+        t['global_font_scale'].setValue(size / 100.0)
+        _qc_text2_set_font(t, font)
+    else:
+        t['size'].setValue(size)
     t['color'].setValue(list(rgb) + [1.0])
-    if isinstance(font, tuple):  # (ttc path, face index) - the Text node picks the face with a font=file + index knob
-        _set(t, 'font', font[0])
-        _set(t, 'index', font[1])
-    elif font:
-        _set(t, 'font', font)
+    _set(t, 'cliptype', 'no clip')  # see _qc_rect_node; ignored where the Text node has no such knob
+    if not _qc_is_text2(t):
+        font = _qc_legacy_font(font)
+        if isinstance(font, tuple):  # (ttc path, face index) - the Text node picks the face with a font=file + index knob
+            _set(t, 'font', font[0])
+            _set(t, 'index', font[1])
+        elif font:
+            _set(t, 'font', font)
     return t
 
 
@@ -16499,6 +18411,328 @@ def _qc_mp_text_node(inp, msg, box, left, size, font, name, owned_nodes, low):
         cur = _qc_text_node(cur, msg, (box[0] + dx, box[1] + dy, box[2] + dx, box[3] + dy), left, False, size,
                             (0, 0, 0), font, '%s_ol%d' % (name, k), owned_nodes)
     return _qc_text_node(cur, msg, box, left, False, size, QC_MP_RGB, font, name, owned_nodes)
+
+
+QC_MP_POSITIONS = ('above_tc', 'TL', 'TR', 'BL', 'BR', 'custom')  # order of the MP position knob
+QC_MP_SCALE_RANGE = (.25, 8.)  # Custom jack scale is clamped to this range (multiplies the size %)
+
+
+def qc_mp_label_height(layout):
+    """MP label height in pixels at the build-time size (same operations as qc_review_layout)."""
+    return math.ceil(layout['mp_size'] * 1.5) + 2 * layout['pad']
+
+
+def _nk(value):
+    """Exact numeric literal for a Nuke expression (repr keeps every bit of a float)."""
+    value = float(value)
+    return str(int(value)) if value.is_integer() else repr(value)
+
+
+def _qc_expr(node, knob, expr, channel=None):
+    """Drive one knob (or one channel of it) by an expression; False where the host refuses."""
+    try:
+        if channel is None:
+            node[knob].setExpression(expr)
+        else:
+            node[knob].setExpression(expr, channel)
+        return True
+    except Exception:
+        return False
+
+
+def _qc_add_knob(node, kind, name, label, value=None, items=None, rng=None, hidden=False):
+    """Add one user knob to a QC Group. Returns it, or None where the host lacks the knob type."""
+    try:
+        knob = (nuke.Enumeration_Knob(name, label, list(items)) if kind == 'Enumeration_Knob'
+                else getattr(nuke, kind)(name, label))
+        if rng is not None:
+            knob.setRange(*rng)
+        if hidden:
+            knob.setFlag(nuke.INVISIBLE)
+        node.addKnob(knob)
+        if value is not None:
+            knob.setValue(value)
+        return knob
+    except Exception:
+        return None
+
+
+def _qc_mp_faces(opts, mono, log=print):
+    """(font for the current weight, bold ttc face index / 'style' / None). Set only where bold and regular are
+    one family (Text2 styles) or faces of one font file (legacy Text on macOS Menlo.ttc), so the weight can follow a knob live.
+    Whether the label nodes will be Text2 is settled first (_qc_text2_creatable): deciding 'style' and then falling back
+    to legacy Text left the weight knob without the index expression the legacy node needs."""
+    if _qc_text2_creatable():  # Text2 takes the weight as a style of one family: 'style' marks that it can follow the knob
+        font = _qc_mp_font(opts, mono, log)
+        bold, regular = _qc_font_pick('mono', True), _qc_font_pick('mono')
+        return font, ('style' if bold and regular and bold.family == regular.family else None)
+    if isinstance(mono, QcFont):  # picked while Text2 still looked usable: the legacy Text node needs a font file
+        mono = _qc_legacy_fonts()[0]
+    font = _qc_mp_font(opts, mono, log)
+    bold = _qc_mp_font(dict(opts, review_mp_weight='bold'), mono, lambda *_: None)
+    if isinstance(bold, tuple) and mono == bold[0]:
+        return (bold[0], bold[1] if qc_mp_weight(opts) == 'bold' else 0), bold[1]
+    return font, None
+
+
+# Pure-nuke callback bodies (no engine import: a script opened without the tool must still work).
+# 'n' is the Group that owns the mp_* knobs, 'kname' the knob that changed ('' on creation). mp_translate and
+# mp_scale are Link_Knobs to the hidden Transform mp_xform inside the MP Group, so the Viewer draws a Transform
+# jack on the label while they are visible (Custom only). Choosing Custom pins the custom origin (mp_ox, mp_oy)
+# to the last preset's position and resets the jack, so the label does not move; moving the jack while a preset
+# is active (by script or expression) pins the origin the same way, keeps the move and switches to Custom.
+# n[name] on a Link_Knob answers the linked knob (values); n.knobs()[name] is the Link_Knob itself (visibility).
+# mp_weight (Text2 labels): the style of the label's Text2 nodes follows it, only to a style nuke.getFonts() lists
+# (the family stays, the style is the listed Bold or Regular/Book; a Text2 font cannot be driven by an expression; inside a callback Font setValue(family, style) applies the style but
+# then raises, so the font is set from its script form); legacy Text labels follow it through their index expression.
+QC_MP_CALLBACK_BODY = """
+kn = n.knobs()
+if 'mp_translate' in kn and 'mp_position' in kn:
+    pos = int(n['mp_position'].getValue())
+    busy = n['mp_busy'].getValue()
+    hold = n if 'g_pl' in kn else None
+    for c in (n.nodes() if hold is None else []):
+        if 'g_pl' in c.knobs():
+            hold = c
+            break
+    if kname == 'mp_position':
+        if pos != 5:
+            n['mp_prev'].setValue(pos)
+        elif not busy and hold is not None:
+            n['mp_busy'].setValue(1)
+            n['mp_translate'].setValue([0.0, 0.0])
+            n['mp_scale'].setValue(1.0)
+            n['mp_ox'].setValue(hold['g_pl'].getValue())
+            n['mp_oy'].setValue(hold['g_pb'].getValue())
+            n['mp_busy'].setValue(0)
+    elif kname in ('mp_translate', 'mp_scale', 'translate', 'scale') and pos != 5 and not busy:
+        n['mp_busy'].setValue(1)
+        if hold is not None:
+            n['mp_ox'].setValue(hold['g_pl'].getValue())
+            n['mp_oy'].setValue(hold['g_pb'].getValue())
+        n['mp_position'].setValue(5)
+        n['mp_busy'].setValue(0)
+        pos = 5
+    for name in ('mp_translate', 'mp_scale'):
+        kn[name].setVisible(pos == 5)
+if 'mp_weight' in kn and kname in ('mp_weight', ''):
+    wants = ('Bold',) if int(n['mp_weight'].getValue()) == 0 else ('Regular', 'Book')
+    labels, todo = [], [n]
+    while todo:
+        for c in todo.pop().nodes():
+            if c.Class() == 'Group':
+                todo.append(c)
+            elif c.Class() == 'Text2' and c.name().split('_ol')[0] in ('mp_prefix', 'mp_tc'):
+                labels.append(c)
+    listed = dict(((str(f[0]), str(f[1])), (str(f[2]).replace('\\\\', '/').split('/')[-1], int(f[3]))) for f in nuke.getFonts()) if labels else {}
+    for c in labels:
+        family, style = [x.strip() for x in c['font'].toScript().strip('{} ').split(' : ')[:2]]
+        want = [w for w in wants if (family, w) in listed][:1]
+        if want and style not in wants:
+            c['font'].fromScript('{ %s : %s : %s : %d }' % ((family, want[0]) + listed[(family, want[0])]))
+"""
+# Both callbacks can run on a node that is not attached (script load before the knobs exist, scriptClear, the node
+# deleted then restored by undo): "PythonObject is not attached to a node". Skip quietly then; the panel's showPanel
+# knobChanged applies the same visibility the next time it opens.
+def _qc_mp_guarded(head):
+    """Wrap the shared body (and the lines that read the node and knob) in one try/except ValueError."""
+    lines = head.strip('\n').split('\n') + QC_MP_CALLBACK_BODY.strip('\n').split('\n')
+    return "try:\n" + ''.join('    ' + line + '\n' for line in lines) + "except ValueError:\n    pass\n"
+
+
+QC_MP_KNOB_CHANGED = _qc_mp_guarded("n = nuke.thisNode()\nkname = nuke.thisKnob().name()")
+QC_MP_ON_CREATE = _qc_mp_guarded("n = nuke.thisNode()\nkname = ''")
+
+
+def add_mp_label_knobs(node, opts, bold_face=None, size=None, xform='mp_xform', height=None):
+    """User knobs of an MP label (on the MP Group itself, or on the Group that encloses it).
+
+    Values come from the run options, so the label renders exactly as configured until a knob changes.
+    size = (W, H) of the frame the label is drawn in, height = the label height there. xform = path of the MP Group's hidden Transform seen
+    from node ('mp_xform' on the MP Group itself, '<MP Group name>.mp_xform' from the enclosing Group);
+    mp_translate / mp_scale link to its translate / scale, which draws the Transform jack in the Viewer.
+    """
+    position = opts.get('review_mp_position', 'above_tc')
+    _qc_add_knob(node, 'Text_Knob', 'mp_section', '', _t('MP 라벨 (플레이트 TC)', 'MP label (plate TC)'))
+    _qc_add_knob(node, 'Boolean_Knob', 'mp_show', _t('MP 라벨 표시', 'Show MP label'), True)
+    _qc_add_knob(node, 'Enumeration_Knob', 'mp_position', _t('위치', 'Position'),
+                 QC_MP_POSITIONS.index(position) if position in QC_MP_POSITIONS else 0,
+                 items=(_t('TC 위', 'Above TC'), _t('왼쪽 위', 'Top left'), _t('오른쪽 위', 'Top right'),
+                        _t('왼쪽 아래', 'Bottom left'), _t('오른쪽 아래', 'Bottom right'),
+                        _t('직접 지정', 'Custom')))
+    for key, label in (('translate', _t('이동', 'Translate')), ('scale', _t('배율', 'Scale'))):
+        link = _qc_add_knob(node, 'Link_Knob', 'mp_' + key, label)
+        if link is not None:
+            try:
+                link.makeLink(xform, key)
+            except Exception:
+                pass
+    # custom origin: bottom left of the label where Custom started (output-format pixels); the jack moves it
+    # (same operations as qc_review_layout, so a Custom start renders exactly where the run options put it)
+    ox = oy = 0.0
+    if size and position == 'custom':
+        W, H = float(size[0]), float(size[1])
+        ox = float(opts.get('review_mp_x', 75)) / 100. * W
+        oy = H - float(opts.get('review_mp_y', 85)) / 100. * H - (height or 0)
+    _qc_add_knob(node, 'Double_Knob', 'mp_ox', 'mp_ox', ox, hidden=True)
+    _qc_add_knob(node, 'Double_Knob', 'mp_oy', 'mp_oy', oy, hidden=True)
+    _qc_add_knob(node, 'Int_Knob', 'mp_prev', 'mp_prev',
+                 QC_MP_POSITIONS.index(position) if position in QC_MP_POSITIONS[:5] else 0, hidden=True)
+    _qc_add_knob(node, 'Int_Knob', 'mp_busy', 'mp_busy', 0, hidden=True)
+    _qc_add_knob(node, 'Double_Knob', 'mp_size', _t('크기 %', 'Size %'),
+                 float(opts.get('review_mp_size', QC_MP_SIZE_DEFAULT)), rng=(50, 200))
+    _qc_add_knob(node, 'Double_Knob', 'mp_opacity', _t('배경 불투명도 %', 'BG opacity %'),
+                 qc_mp_opacity_percent(opts), rng=(0, 100))
+    if bold_face is not None:
+        _qc_add_knob(node, 'Enumeration_Knob', 'mp_weight', _t('글꼴 굵기', 'Font weight'),
+                     0 if qc_mp_weight(opts) == 'bold' else 1, items=(_t('굵게', 'Bold'), _t('보통', 'Regular')))
+    _qc_add_knob(node, 'Color_Knob', 'mp_bg_color', _t('배경 색', 'BG color'), list(QC_MP_RGB))
+    _qc_add_knob(node, 'Color_Knob', 'mp_text_color', _t('글자 색', 'Text color'), [0.0, 0.0, 0.0])
+    for knob, code in (('knobChanged', QC_MP_KNOB_CHANGED), ('onCreate', QC_MP_ON_CREATE)):
+        try:
+            node[knob].setValue(code)
+        except Exception:
+            pass
+    for knob in ('mp_translate', 'mp_scale'):  # starting visibility (onCreate redoes it on load)
+        try:
+            node.knobs()[knob].setVisible(position == 'custom')  # the Link_Knob itself; node[...] is the linked knob
+        except Exception:
+            pass
+
+
+def build_mp_label_group(inp, msg, layout, opts, mono=None, log=print, name=None, owned_nodes=None,
+                         link_parent=False, label=None):
+    """MP (plate TC) label as one Group: background Rectangle + 'MP' prefix Text + TC Text.
+
+    msg is the TC Text message: a literal per-frame list, or a TimeWarp lookup expression whose node
+    paths must be absolute ('root.NMMR_timewarp_1') because the Text is evaluated inside this Group.
+    layout comes from qc_review_layout. Knobs: show, position preset, Custom translate/scale (a Transform
+    jack in the Viewer), size %, background opacity %, background and text colour, and the weight where both
+    weights are faces of one font file. The geometry follows the knobs through expressions; at the build-time
+    values every expression gives exactly what the flat label nodes were set to, so the rendered pixels are
+    the same. The jack's Transform (mp_xform) is not in the image path: its translate moves the label from the
+    custom origin and its scale multiplies the text size (re-rendered, never resampled), centred on the label.
+    Below 40 % background opacity the black outline copies switch on and the text turns yellow, as before.
+    link_parent=True reads the knobs from the enclosing Group (see add_mp_label_knobs) instead.
+    Returns the Group.
+    """
+    if mono is None:
+        mono = _qc_fonts()[0]
+    font, bold_face = _qc_mp_faces(opts, mono, log)
+    low = qc_mp_text_low(opts)
+    W, H, pad, m = layout['W'], layout['H'], layout['pad'], layout['margin']
+    tc, rectm, szm = layout['tc'], layout['mp'], layout['mp_size']
+    group = _register_owned(nuke.nodes.Group(name=_uname(name or _node_name('QC_mp'))), owned_nodes)
+    if label:
+        _set(group, 'label', label)
+    if not link_parent:
+        add_mp_label_knobs(group, opts, bold_face, (W, H), height=qc_mp_label_height(layout))
+    p = 'parent.' if link_parent else ''
+    # Derived values, mirroring qc_review_layout and the flat label exactly (same operations, same order).
+    sel = lambda terms, key='mp_position': '+'.join('(%s%s==%d)*(%s)' % (p, key, k, t) for k, t in enumerate(terms))
+    corner_l, corner_r = _nk(m), '%s-g_w' % _nk(W - m)
+    # preset terms in QC_MP_POSITIONS order; the last (Custom) is the custom origin plus the jack's translate, less
+    # half the growth from the jack's scale (so it scales about the label centre; exactly the origin at scale 1)
+    terms_l = ('%s-g_w' % _nk(tc[2]), corner_l, corner_r, corner_l, corner_r)
+    tc_b = '(%s+g_h>%s)*(%s-g_h)+(1-(%s+g_h>%s))*(%s)' % (_nk(tc[3] + pad), _nk(H - m), _nk(tc[1] - pad),
+                                                          _nk(tc[3] + pad), _nk(H - m), _nk(tc[3] + pad))
+    terms_b = (tc_b, '%s-g_h' % _nk(H - m), '%s-g_h' % _nk(H - m), _nk(m), _nk(m))
+    clamp_l = lambda t: 'min(max(%s,0),%s-g_w)' % (t, _nk(W))
+    clamp_b = lambda t: 'min(max(%s,0),%s-g_h)' % (t, _nk(H))
+    derived = (
+        ('g_show', '%smp_show' % p),
+        ('g_op', 'min(100,max(0,%smp_opacity))/100' % p),
+        ('g_low', 'g_op<%s' % _nk(QC_MP_LOW_OPACITY)),
+        ('g_s0', 'min(%s*(min(200,max(50,%smp_size))/100),%s)' % (_nk(layout['mp_base']), p, _nk(layout['mp_cap']))),
+        # jack scale, Custom only (exactly 1 for the presets)
+        ('g_k', '1+(%smp_position==5)*(min(%s,max(%s,mp_xform.scale))-1)' % (p, _nk(QC_MP_SCALE_RANGE[1]),
+                                                                          _nk(QC_MP_SCALE_RANGE[0]))),
+        ('g_s', 'g_s0*g_k'),
+        ('g_w', 'ceil(g_s*16*.8)+%d' % (2 * pad)),
+        ('g_h', 'ceil(g_s*1.5)+%d' % (2 * pad)),
+        ('g_w0', 'ceil(g_s0*16*.8)+%d' % (2 * pad)),
+        ('g_h0', 'ceil(g_s0*1.5)+%d' % (2 * pad)),
+        ('g_l', clamp_l(sel(terms_l + ('%smp_ox+mp_xform.translate.x-(g_w-g_w0)/2' % p,)))),
+        ('g_b', clamp_b(sel(terms_b + ('%smp_oy+mp_xform.translate.y-(g_h-g_h0)/2' % p,)))),
+        # jack centre: the label centre at translate 0 (the jack draws at centre + translate)
+        ('g_cx', '%smp_ox+g_w0/2' % p),
+        ('g_cy', '%smp_oy+g_h0/2' % p),
+        # last preset (mp_prev): where Custom starts from, so the label does not jump when it is switched on
+        ('g_pl', clamp_l(sel(terms_l + ('0',), 'mp_prev'))),
+        ('g_pb', clamp_b(sel(terms_b + ('0',), 'mp_prev'))),
+        ('g_bgr', '%smp_bg_color.r' % p), ('g_bgg', '%smp_bg_color.g' % p), ('g_bgb', '%smp_bg_color.b' % p),
+        ('g_txr', 'g_low*%s+(1-g_low)*%smp_text_color.r' % (_nk(QC_MP_RGB[0]), p)),
+        ('g_txg', 'g_low*%s+(1-g_low)*%smp_text_color.g' % (_nk(QC_MP_RGB[1]), p)),
+        ('g_txb', 'g_low*%s+(1-g_low)*%smp_text_color.b' % (_nk(QC_MP_RGB[2]), p)),
+    ) + ((('g_face', '(%smp_weight==0)*%d' % (p, bold_face)),) if isinstance(bold_face, int) else ())
+    for key, expr in derived:
+        knob = _qc_add_knob(group, 'Double_Knob', key, key, hidden=True)
+        if knob is not None:
+            _qc_expr(group, key, expr)
+    made = []
+    group.begin()
+    try:
+        cur = nuke.nodes.Input(name='Input1')
+        rcm = _qc_rect_node(cur, rectm, QC_MP_RGB, qc_mp_opacity(opts), 'mp_bg', made)
+        prefix_width = 3 * szm * .80
+        prefix = _qc_mp_text_node(rcm, 'MP', (rectm[0] + pad, rectm[1] + pad,
+                                              rectm[0] + pad + prefix_width, rectm[3] - pad),
+                                  True, szm * .8, font, 'mp_prefix', made, True)
+        tm = _qc_mp_text_node(prefix, msg, (rectm[0] + pad + prefix_width, rectm[1] + pad,
+                                            rectm[2] - pad, rectm[3] - pad),
+                              False, szm, font, 'mp_tc', made, True)
+        # Transform jack for Custom: outside the image path (no input, not connected), only its knobs are used
+        xf = nuke.nodes.Transform(name='mp_xform')
+        try:
+            xf.setInput(0, None)
+        except Exception:
+            pass
+        out = nuke.nodes.Output(name='Output1')
+        out.setInput(0, tm)
+        g = lambda key: 'parent.' + key
+        _qc_expr(xf, 'center', g('g_cx'), 0)
+        _qc_expr(xf, 'center', g('g_cy'), 1)
+        _qc_expr(rcm, 'opacity', g('g_op'))
+        _qc_expr(rcm, 'disable', '1-' + g('g_show'))
+        for k, key in enumerate((g('g_l'), g('g_b'), '%s+%s' % (g('g_l'), g('g_w')), '%s+%s' % (g('g_b'), g('g_h')))):
+            _qc_expr(rcm, 'area', key, k)
+        for k, key in enumerate(('g_bgr', 'g_bgg', 'g_bgb')):
+            _qc_expr(rcm, 'color', g(key), k)
+        boxes = dict(
+            mp_prefix=('%s*.8' % g('g_s'),
+                       ('%s+%d' % (g('g_l'), pad), '%s+%d' % (g('g_b'), pad),
+                        '%s+%d+3*%s*.8' % (g('g_l'), pad, g('g_s')), '%s+%s-%d' % (g('g_b'), g('g_h'), pad))),
+            mp_tc=(g('g_s'),
+                   ('%s+%d+3*%s*.8' % (g('g_l'), pad, g('g_s')), '%s+%d' % (g('g_b'), pad),
+                    '%s+%s-%d' % (g('g_l'), g('g_w'), pad), '%s+%s-%d' % (g('g_b'), g('g_h'), pad))))
+        for node in made[1:]:
+            base = node.name().split('_ol')[0]
+            size, box = boxes[base]
+            _qc_expr(node, _qc_size_knob(node), _qc_size_expr(node, size))
+            shift = ('',) * 4
+            if '_ol' in node.name():
+                d = 'max(1,%s/14)' % size
+                sx, sy = ((-1, -1), (1, -1), (-1, 1), (1, 1))[int(node.name()[-1])]
+                shift = tuple('%s(%s)' % ('-' if s < 0 else '+', d) for s in (sx, sy, sx, sy))
+                _set(node, 'disable', not low)
+                _qc_expr(node, 'disable', 'max(1-%s,1-%s)' % (g('g_show'), g('g_low')))
+            else:
+                _qc_expr(node, 'disable', '1-' + g('g_show'))
+                if not low:
+                    node['color'].setValue([0.0, 0.0, 0.0, 1.0])  # black text over an opaque background
+                for k, key in enumerate(('g_txr', 'g_txg', 'g_txb')):
+                    _qc_expr(node, 'color', g(key), k)
+            for k in range(4):
+                _qc_expr(node, 'box', ('(%s)%s' % (box[k], shift[k])) if shift[k] else box[k], k)
+            if isinstance(bold_face, int) and not _qc_is_text2(node):
+                _qc_expr(node, 'index', g('g_face'))
+        cur.setXYpos(0, 0)
+        for k, node in enumerate(made + [out]):
+            node.setXYpos(0, 48 * (k + 1))
+        xf.setXYpos(220, 0)
+    finally:
+        group.end()
+    return group
 
 
 def _qc_labels(e, mono, cjk):
@@ -16543,6 +18777,676 @@ def qc_review_dimensions(width, height, resolution='fhd'):
     return tuple(max(2, int(round(v * scale / 2.0)) * 2) for v in (width, height))
 
 
+QC_WRITE_COLORSPACE_PREFS = ('Output - sRGB', 'sRGB - Display', 'sRGB', 'srgb_display',
+                             'Output - Rec.709', 'Rec.1886 Rec.709 - Display', 'rec709')
+
+
+def _colorspace_entry_name(value):
+    """'Output/Output - sRGB\tdescription' -> 'Output - sRGB' (family path and description dropped)."""
+    return str(value or '').split('\t', 1)[0].strip().rsplit('/', 1)[-1].strip()
+
+
+def qc_write_colorspace_choice(values, current):
+    """Colorspace for the QC review Write, chosen only from the knob's own list.
+
+    Returns None to keep the current value: it (or the name inside 'default (...)') exists in the
+    list, the list is unknown, or the list has no display-referred sRGB / Rec.709 name. Otherwise
+    returns the raw list entry of the preferred name. A default such as 'default (Gamma2.2)' that the
+    active OCIO config does not define stops the render ('Invalid LUT selected'), so it is replaced.
+    """
+    entries = []
+    for value in values or ():
+        name = _colorspace_entry_name(value)
+        if name and not _is_default_colorspace(name) and name not in [n for n, _ in entries]:
+            entries.append((name, str(value).split('\t', 1)[0].strip()))
+    if not entries:
+        return None
+    text = str(current or '').strip().strip('"').strip()
+    resolved = text[9:-1].strip() if text.startswith('default (') and text.endswith(')') else text
+    if text == 'default' or _colorspace_entry_name(resolved) in [n for n, _ in entries]:
+        return None
+    lower = dict((n.lower(), raw) for n, raw in entries)
+    for name in QC_WRITE_COLORSPACE_PREFS:
+        if name.lower() in lower:
+            return lower[name.lower()]
+    for words in (('srgb',), ('rec.709', 'rec709', 'rec.1886')):
+        for name, raw in entries:
+            low = name.lower()
+            if any(w in low for w in words) and ('display' in low or 'output' in low):
+                return raw
+    return None
+
+
+def _ocio_colorspace_names():
+    """Colorspace names the active OCIO config defines, or None when colour management is not OCIO."""
+    try:
+        if _root_color_value('colorManagement') != 'OCIO':
+            return None
+        return [str(n) for n in nuke.getOcioColorSpaces()] or None
+    except Exception:
+        return None
+
+
+def qc_write_colorspace_valid_values(values, ocio_names):
+    """Drop Write colorspace entries the active OCIO config does not define.
+
+    Nuke appends the knob's current value to its enum even when the config lacks it (an ACES config
+    lists both 'default (Gamma2.2)' and a literal 'Gamma2.2'), so membership in the knob list alone
+    does not prove the value renders. With an OCIO name list, keep only entries whose name is in it
+    (role entries are kept). Without one, the list is returned unchanged."""
+    if not ocio_names:
+        return list(values or ())
+    # getOcioColorSpaces() returns raw 'Name\tFamily/Name' strings; compare by the name before the tab.
+    known = set(_colorspace_entry_name(n) for n in ocio_names)
+    kept = []
+    for value in values or ():
+        name = _colorspace_entry_name(value)
+        raw = str(value)
+        if name in known or _is_default_colorspace(name) or 'role' in raw.lower():
+            kept.append(value)
+    return kept
+
+
+def qc_write_colorspace_message(chosen, previous):
+    """Log line for the QC review Write colorspace change; an empty previous value reads as the default."""
+    previous = str(previous or '').strip().strip('"').strip()
+    if previous in ('', 'default'):
+        return _t('QC 리뷰 Write 색공간: %s 로 설정 (이전 값: 기본값)',
+                  'QC review Write colorspace: set to %s (previous: default)') % chosen
+    return _t('QC 리뷰 Write 색공간: %s (이전 값 %s 는 현재 설정에 없음)',
+              'QC review Write colorspace: %s (previous value %s is not in the current config)') % (chosen, previous)
+
+
+def configure_review_write_colorspace(wr, log=print, preferred=None):
+    """Set a colorspace the current config defines on the QC review Write. Returns the value set or None.
+
+    preferred: colorspace inferred from the script's existing Writes. It is tried first and used only when the
+    knob list (filtered by the active OCIO config) holds it; otherwise the usual choice applies."""
+    try:
+        knob = wr['colorspace']
+    except Exception:
+        return None
+    if preferred and not _is_default_colorspace(preferred):
+        try:
+            allowed = qc_write_colorspace_valid_values(list(knob.values()), _ocio_colorspace_names())
+        except Exception:
+            allowed = []
+        want = _colorspace_entry_name(preferred)
+        names = [_colorspace_entry_name(v) for v in allowed]
+        if want in names:
+            raw = str(allowed[names.index(want)]).split('\t', 1)[0].strip()
+            for value in (raw, want):
+                try:
+                    knob.setValue(value)
+                    if _colorspace_entry_name(knob.value()) == want:
+                        return knob.value()
+                except Exception:
+                    continue
+    try:
+        values = list(knob.values())
+    except Exception:
+        values = []
+    if not values:
+        try:
+            if _root_color_value('colorManagement') == 'OCIO':
+                values = list(nuke.getOcioColorSpaces())
+        except Exception:
+            values = []
+    try:
+        current = knob.value()
+    except Exception:
+        current = ''
+    ocio = _ocio_colorspace_names()
+    values = qc_write_colorspace_valid_values(values, ocio)
+    if ocio and str(current or '').strip().strip('"').strip() in ('', 'default'):
+        # A fresh Write reports a bare 'default' before its codec label resolves; for mov/h264 that
+        # resolves to Gamma2.2, which an OCIO config usually lacks. Do not trust it under OCIO.
+        current = ''
+    choice = qc_write_colorspace_choice(values, current)
+    if choice is None:
+        return None
+    for value in (choice, _colorspace_entry_name(choice)):
+        try:
+            knob.setValue(value)
+            if _colorspace_entry_name(knob.value()) == _colorspace_entry_name(choice):
+                log(qc_write_colorspace_message(_colorspace_entry_name(choice), current))
+                return knob.value()
+        except Exception:
+            continue
+    return None
+
+
+# Studio Write settings the QC review Write follows (user request 2026-11-08). Only output-encoding knobs
+# file path, proxy, frame range, callbacks, label/name/colour, disable and render order stay NMMR's.
+STUDIO_WRITE_TYPE_KNOBS = {
+    'mov': ('mov64_codec', 'mov_prores_codec_profile', 'mov_h264_codec_profile', 'mov64_dnxhd_codec_profile',
+            'mov64_dnxhr_codec_profile', 'mov64_pixel_format', 'mov64_quality', 'mov64_bitrate',
+            'mov64_bitrate_tolerance', 'mov64_quality_min', 'mov64_quality_max', 'mov64_gop_size',
+            'mov64_b_frames', 'mov64_ycbcr_matrix_type', 'mov64_write_timecode'),
+    'jpeg': ('_jpeg_quality', '_jpeg_sub_sampling'),
+    'exr': ('compression', 'datatype', 'metadata'),
+    'png': ('datatype',),
+    'tiff': ('datatype', 'compression'),
+}
+STUDIO_WRITE_COLOR_KNOBS = ('transformType', 'colorspace', 'display', 'view')
+STUDIO_WRITE_COMMON_KNOBS = ('channels', 'views')
+# Colour knobs of another format follow only from display-referred review formats: an EXR/DPX Write stores
+# scene-linear or log data, and its colorspace would make an 8-bit review look wrong.
+STUDIO_WRITE_DISPLAY_TYPES = ('mov', 'jpeg', 'png')
+# Knobs deliberately not followed. Anything else a studio Write carries that a fresh Write lacks is reported.
+STUDIO_WRITE_IGNORED = frozenset((
+    'file', 'proxy', 'file_type', 'use_limit', 'first', 'last', 'frame_mode', 'frame', 'reading', 'checkHashOnRead',
+    'beforeRender', 'afterRender', 'beforeFrameRender', 'afterFrameRender', 'renderProgress', 'onCreate',
+    'onDestroy', 'knobChanged', 'updateUI', 'autolabel', 'label', 'name', 'tile_color', 'gl_color', 'note_font',
+    'note_font_size', 'note_font_color', 'disable', 'render_order', 'xpos', 'ypos', 'selected', 'hide_input',
+    'postage_stamp', 'cached', 'help', 'indicators', 'bookmark', 'dope_sheet', 'lifetimeStart', 'lifetimeEnd',
+    'useLifetime', 'mov64_fps', 'mov64_audiofile', 'mov64_audio_offset', 'mov64_units', 'mov64_format',
+    'raw', 'create_directories', 'Render', 'inputs', 'process_mask', 'icon', 'panel'))
+
+
+# A studio Write colorspace the QC review follows only when it is display/output-referred: a log or scene-linear
+# movie Write (an ACEScct / LogC delivery, a linear EXR) would make the review show log or flat linear images.
+STUDIO_SCENE_COLORSPACE_WORDS = ('log', 'linear', 'lin_', 'scene', 'acescg', 'acescct', 'acescc', 'aces2065',
+                                 'ap0', 'ap1', 'cineon', 'adx', 'raw', 'data', 'reference')
+STUDIO_DISPLAY_COLORSPACE_WORDS = ('output', 'display', 'srgb', 'rec.709', 'rec709', 'bt.709', 'bt709',
+                                   'rec.1886', 'rec1886', 'gamma', 'g2.2', 'g2.4', 'p3', 'rec.2020', 'rec2020')
+
+
+def studio_colorspace_followable(value, ocio_names=None):
+    """True when a studio Write colorspace is an output/display encoding the QC review may follow.
+
+    The OCIO family (from getOcioColorSpaces() 'Name\\tFamily/Name' entries, or a 'Family/Name' value) is read
+    first: an 'Output' / 'Display' family is followed unless the name says log or linear. Without a family the
+    name decides: scene words (log, linear, ACEScg, ACEScct, ...) never follow; display words (Output -, sRGB,
+    Rec.709, Gamma, ...) do. Anything unrecognised does not follow (NMMR's own display choice applies)."""
+    name = _colorspace_entry_name(value)
+    if not name or _is_default_colorspace(name):
+        return False
+    family = ''
+    raw = str(value or '').split('\t', 1)[0].strip()
+    if '/' in raw:
+        family = raw.rsplit('/', 1)[0]
+    for entry in ocio_names or ():
+        text = str(entry)
+        if _colorspace_entry_name(text.split('\t', 1)[0]) == name and '\t' in text:
+            path = text.split('\t', 1)[1].strip()
+            family = path.rsplit('/', 1)[0] if '/' in path else family
+            break
+    low, fam = name.lower(), family.lower()
+    if any(word in low or word in fam for word in STUDIO_SCENE_COLORSPACE_WORDS):
+        return False
+    if 'output' in fam or 'display' in fam:
+        return True
+    return any(word in low for word in STUDIO_DISPLAY_COLORSPACE_WORDS)
+
+
+def _studio_knob_value(node, knob):
+    """Plain, hashable value of a Write knob, or None when it is missing or empty."""
+    try:
+        if knob not in node.knobs():
+            return None
+        value = node[knob].value()
+    except Exception:
+        return None
+    if isinstance(value, list):
+        value = tuple(value)
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    return value
+
+
+def _studio_write_snapshot(node, known=None):
+    """dict(file_type, disabled, knobs, unknown) for one existing Write, None for NMMR's own nodes."""
+    try:
+        if node.Class() != 'Write':
+            return None
+        full = node.fullName() if hasattr(node, 'fullName') else node.name()
+    except Exception:
+        return None
+    if any(_is_tool_node_name(part) for part in str(full).split('.')):
+        return None
+    ftype = str(_studio_knob_value(node, 'file_type') or '').strip().lower()
+    names = set(STUDIO_WRITE_COLOR_KNOBS) | set(STUDIO_WRITE_COMMON_KNOBS)
+    for group in STUDIO_WRITE_TYPE_KNOBS.values():
+        names.update(group)
+    knobs = {}
+    for knob in names:
+        value = _studio_knob_value(node, knob)
+        if value is not None:
+            knobs[knob] = value
+    unknown = []
+    if known is not None:
+        try:
+            present = list(node.knobs())
+        except Exception:
+            present = []
+        typed = tuple(t + '_' for t in STUDIO_WRITE_TYPE_KNOBS) + ('mov64_', 'mov_', '_jpeg', 'exr_', 'tif_', 'dpx_')
+        unknown = [k for k in present if k not in known and k not in names and k not in STUDIO_WRITE_IGNORED
+                   and not str(k).startswith(typed)]
+    return dict(file_type=ftype, disabled=bool(_studio_knob_value(node, 'disable')), knobs=knobs,
+                unknown=unknown)
+
+
+def infer_studio_write_settings(writes, file_type, ocio_names=None, defaults=None, known=None):
+    """Settings the QC review Write should take from the script's existing (studio) Writes.
+
+    writes: Write nodes of the script; NMMR's own nodes are ignored, and disabled Writes count only when no
+    enabled Write exists. file_type: the review format NMMR chose ('mov' / 'jpeg'); it is never changed.
+    Format knobs follow Writes of the same file_type. Colour knobs follow the same file_type, else other
+    display-referred formats. channels/views follow the same file_type, else any Write. Each knob takes its
+    most frequent value; on a tie the last Write in node order (creation order) wins. A colorspace the active
+    OCIO config lacks, or one that is not output/display-referred (studio_colorspace_followable), is dropped. defaults: knobDefault values ({knob: value}) used for knobs no Write gave.
+    known: knob names of a fresh Write, used only to report custom knobs that are never followed.
+    Returns (settings, info) with info = dict(writes, same_type, from_defaults, dropped, unknown)."""
+    file_type = str(file_type or '').lower()
+    snaps = [s for s in (_studio_write_snapshot(w, known) for w in (writes or ())) if s]
+    pool = [s for s in snaps if not s['disabled']] or snaps
+    same = [s for s in pool if s['file_type'] == file_type]
+    colour = same or [s for s in pool if s['file_type'] in STUDIO_WRITE_DISPLAY_TYPES]
+    common = same or pool
+
+    def pick(knob, sources):
+        values = [s['knobs'][knob] for s in sources if knob in s['knobs']]
+        if not values:
+            return None
+        counts = {}
+        for value in values:
+            counts[value] = counts.get(value, 0) + 1
+        top = max(counts.values())
+        return next(v for v in reversed(values) if counts[v] == top)
+
+    plan = [(k, same) for k in STUDIO_WRITE_TYPE_KNOBS.get(file_type, ())]
+    plan += [(k, colour) for k in STUDIO_WRITE_COLOR_KNOBS] + [(k, common) for k in STUDIO_WRITE_COMMON_KNOBS]
+    settings, from_defaults, dropped = {}, [], []
+    for knob, sources in plan:
+        value = pick(knob, sources)
+        if value is None and defaults and defaults.get(knob) not in (None, ''):
+            value = defaults[knob]
+            from_defaults.append(knob)
+        if value is not None:
+            settings[knob] = value
+    cs = settings.get('colorspace')
+    if cs is not None:
+        names = set(_colorspace_entry_name(n) for n in (ocio_names or ()))
+        if _is_default_colorspace(cs) or (ocio_names and _colorspace_entry_name(cs) not in names) or \
+                not studio_colorspace_followable(cs, ocio_names):
+            settings.pop('colorspace')
+            if not _is_default_colorspace(cs):
+                missing = bool(ocio_names) and _colorspace_entry_name(cs) not in names
+                dropped.append(('colorspace_missing' if missing else 'colorspace', cs))
+    if str(settings.get('transformType', '')).lower() != 'display':
+        for knob in ('display', 'view'):
+            settings.pop(knob, None)
+    if file_type in ('mov', 'jpeg') and str(settings.get('channels', 'rgb')) not in ('rgb', 'rgba'):
+        dropped.append(('channels', settings.pop('channels')))  # a review movie carries rgb(a) only
+    if len(str(settings.get('views', '')).split()) > 1:
+        dropped.append(('views', settings.pop('views')))  # the review graph is mono
+    from_defaults = [k for k in from_defaults if k in settings]
+    unknown = []
+    for s in pool:
+        unknown.extend(k for k in s['unknown'] if k not in unknown)
+    return settings, dict(writes=len(pool), same_type=len(same), from_defaults=from_defaults,
+                          dropped=dropped, unknown=unknown)
+
+
+def _studio_values_equal(a, b):
+    try:
+        return abs(float(a) - float(b)) < 1e-6
+    except (TypeError, ValueError):
+        return str(a).split('\t', 1)[0].strip() == str(b).split('\t', 1)[0].strip()
+
+
+def apply_studio_write_settings(wr, settings):
+    """Set the inferred settings (colorspace excluded: configure_review_write_colorspace owns it) on the QC
+    review Write. Each value is read back; a value the knob rejects keeps the previous one. Returns the
+    {knob: value} actually applied."""
+    applied = {}
+    order = ['transformType', 'display', 'view'] + list(STUDIO_WRITE_COMMON_KNOBS)
+    order += [k for group in STUDIO_WRITE_TYPE_KNOBS.values() for k in group if k not in order]
+    for knob in order:
+        if knob not in settings:
+            continue
+        try:
+            if knob not in wr.knobs():
+                continue
+            k = wr[knob]
+            before = k.value()
+        except Exception:
+            continue
+        value = settings[knob]
+        tries = [value]
+        if isinstance(value, str):
+            try:
+                tries.append(float(value))  # knobDefault strings for numeric knobs
+            except ValueError:
+                pass
+        for candidate in tries:
+            try:
+                k.setValue(candidate)
+                if _studio_values_equal(k.value(), candidate):
+                    applied[knob] = candidate
+                    break
+            except Exception:
+                continue
+        if knob not in applied:
+            try:
+                k.setValue(before)
+            except Exception:
+                pass
+    return applied
+
+
+STUDIO_WRITE_LABELS = {
+    'colorspace': ('색공간', 'colorspace'), 'channels': ('채널', 'channels'), 'mov64_codec': ('코덱', 'codec'),
+    'mov_prores_codec_profile': ('ProRes', 'ProRes'), 'mov64_quality': ('품질', 'quality'),
+    '_jpeg_quality': ('품질', 'quality'), 'display': ('디스플레이', 'display'), 'view': ('뷰', 'view'),
+}
+
+
+def studio_write_message(applied, info):
+    """One log line saying where the QC review Write settings came from."""
+    if not info or (not info.get('writes') and not applied):
+        return _t('QC 리뷰 Write: 스크립트에 기존 Write 없음 — NMMR 기본값',
+                  'QC review Write: no existing Write in the script — NMMR defaults')
+    parts = []
+    for knob, value in applied.items():
+        if knob == 'transformType':
+            continue
+        label = STUDIO_WRITE_LABELS.get(knob)
+        text = str(value).split('\t', 1)[0]
+        if label and _t(*label).lower() in text.lower():
+            parts.append(text)  # the value already names the label ('ProRes 4:2:2 HQ'): no 'ProRes ProRes'
+        else:
+            parts.append('%s %s' % (_t(*label), text) if label else '%s=%s' % (knob, text))
+    shown = ' · '.join(parts[:5]) + (_t(' 외 %d개', ' +%d more') % (len(parts) - 5) if len(parts) > 5 else '')
+    if not info.get('writes'):
+        line = _t('QC 리뷰 Write: Write 기본값(knobDefault)을 따름 (%s)',
+                  'QC review Write: follows the Write knob defaults (%s)') % shown
+    elif not parts:
+        line = _t('QC 리뷰 Write: 기존 Write %d개에 따를 설정 없음 — NMMR 기본값',
+                  'QC review Write: nothing to follow in %d existing Writes — NMMR defaults') % info['writes']
+    else:
+        line = _t('QC 리뷰 Write: 스크립트의 Write %d개에서 설정을 따름 (%s)',
+                  'QC review Write: follows settings from %d Writes in the script (%s)') % (info['writes'], shown)
+    for knob, value in info.get('dropped') or ():
+        text = str(value).split('\t', 1)[0]
+        if knob == 'colorspace':
+            line += _t(' (색공간 %s 는 장면 색공간이라 따르지 않음)', ' (colorspace %s not followed: scene-referred)') % text
+        elif knob == 'colorspace_missing':
+            line += _t(' (색공간 %s 는 지금 OCIO 설정에 없어 따르지 않음)', ' (colorspace %s not followed: not in the current OCIO config)') % text
+        else:
+            line += _t(' (%s %s 는 리뷰 영상에 맞지 않아 따르지 않음)',
+                       ' (%s %s not followed: not usable for the review movie)') % (knob, text)
+    if info.get('unknown'):
+        line += _t(' · 따르지 않은 사용자 노브: %s', ' · custom knobs not followed: %s') % ', '.join(info['unknown'][:6])
+    return _singular(line)
+
+
+def _studio_write_nodes():
+    """Every Write in the script (inside groups too), NMMR's own excluded later by the snapshot."""
+    try:
+        return list(nuke.allNodes('Write', recurseGroups=True))
+    except Exception:
+        try:
+            return list(nuke.allNodes('Write'))
+        except Exception:
+            return []
+
+
+def _studio_write_defaults(file_type):
+    """knobDefault values registered for Write ({knob: value}); the file-type form ('Write.mov.knob') wins."""
+    names = list(STUDIO_WRITE_TYPE_KNOBS.get(file_type, ())) + list(STUDIO_WRITE_COLOR_KNOBS) + \
+        list(STUDIO_WRITE_COMMON_KNOBS)
+    out = {}
+    for knob in names:
+        for key in ('Write.%s.%s' % (file_type, knob), 'Write.%s' % knob):
+            try:
+                value = nuke.knobDefault(key)
+            except Exception:
+                value = None
+            if value not in (None, ''):
+                out[knob] = value
+                break
+    return out
+
+
+def _dag_tile_width(node):
+    """Drawn tile width: a Dot is 12; any other node is the measured screenWidth (names/labels widen the tile), at least 80."""
+    if node.Class() == 'Dot':
+        return 12
+    try:
+        return max(int(node.screenWidth()), 80)
+    except Exception:
+        return 80
+
+
+def _dag_node_extent(node):
+    """Estimated DAG footprint (width, height) before Nuke repaints a fresh node.
+
+    Nuke draws the name (and label lines) centred on the tile and lets long text spill into the
+    neighbouring nodes, so the width follows the longest text line (~7 px per character at the
+    default DAG font), never less than the tile. Dot labels are drawn beside the dot.
+    """
+    try:
+        name = str(node.name())
+    except Exception:
+        name = ''
+    try:
+        label = str(node['label'].value() or '')
+    except Exception:
+        label = ''
+    label_lines = [line for line in re.sub(r'(?i)<br\s*/?>', '\n', label).splitlines() if line.strip()]
+    if node.Class() == 'Dot':
+        text = max([len(line) for line in label_lines] or [0])
+        return 12 + (text * 7 + 8 if text else 0), 12
+    lines = [name] + label_lines
+    extra = 1 if node.Class() == 'Reformat' else 0  # Reformat shows its target format as a second line
+    width = max(_dag_tile_width(node), max(len(line) for line in lines) * 7 + 12)
+    return width, 18 + 14 * (len(lines) - 1 + extra)
+
+
+def _dag_node_rect(node):
+    """Estimated DAG rectangle (x0, y0, x1, y1) of a fresh node, text included."""
+    w, h = _dag_node_extent(node)
+    x, y = int(node.xpos()), int(node.ypos())
+    if node.Class() == 'Dot':
+        return x, y, x + w, y + h
+    cx = x + _dag_tile_width(node) // 2
+    return cx - w // 2, y, cx + (w - w // 2), y + h
+
+
+def _dag_place_center(node, cx, y):
+    """Put the node's tile centre on column centre cx (Dots are vertically centred on the row)."""
+    tile = _dag_tile_width(node)
+    node.setXYpos(int(round(cx - tile / 2.0)), int(y + (3 if node.Class() == 'Dot' else 0)))
+
+
+def layout_qc_review(blocks, tail=(), note=None, origin=(0, 0), outs=()):
+    """Lay out QC review shot blocks in a compact grid, measured before placing.
+
+    blocks: per shot, a list of (node, side, row): side 'A' = edit side on the left, 'B' = main
+    column (the B pipe). Column widths come from the estimated text widths of their nodes, so names
+    never overlap the neighbouring column. tail = nodes stacked under the grid on the first main column
+    (AppendClip, Write). note = sticky placed right next to the last tail node. outs = per-shot
+    hidden-input Dots laid in rows right above the tail.
+    Returns the bounding rectangle of everything placed.
+    """
+    x0, y0 = origin
+
+    def halves(node):
+        # (room left of the tile centre, room right of it). Dot text runs to the right of the dot.
+        w = _dag_node_extent(node)[0]
+        return (6, w - 6) if node.Class() == 'Dot' else (w / 2.0, w - w / 2.0)
+
+    measured = []
+    for block in blocks:
+        # The edit side puts its Dots flush left, so its width is simply the widest footprint.
+        wa = max([_dag_node_extent(n)[0] for n, side, _ in block if side == 'A'] or [0])
+        main = [halves(n) for n, side, _ in block if side == 'B'] or [(40, 40)]
+        bl, br = max(h[0] for h in main), max(h[1] for h in main)
+        rows = max([row for _, _, row in block] or [0]) + 1
+        tallest = max([_dag_node_extent(n)[1] for n, _, _ in block] or [18])
+        measured.append((wa, bl, (wa + QC_COL_GAP if wa else 0) + bl + br,
+                         (rows - 1) * QC_ROW_STEP + max(tallest, QC_ROW_STEP)))
+    def grid_size(c):
+        widths = [sum(m[2] for m in measured[k:k + c]) + QC_BLOCK_GAP * (len(measured[k:k + c]) - 1)
+                  for k in range(0, len(measured), c)]
+        heights = [max(m[3] for m in measured[k:k + c]) for k in range(0, len(measured), c)]
+        return max(widths or [0]), sum(heights) + QC_BLOCK_GAP * (len(heights) - 1)
+
+    def score(c):
+        w, h = grid_size(c)
+        aspect = w / float(max(h, 1))
+        return w * h * max(1.0, aspect / QC_MAX_ASPECT, 1.0 / max(aspect, 1e-6)), c  # landscape, not too wide
+
+    cols = min(score(c) for c in range(1, max(1, min(QC_COLS, len(blocks))) + 1))[1] if blocks else 1
+    y = y0
+    first_b = None
+    right = x0
+    for start in range(0, len(blocks), cols):
+        x = x0
+        row_height = 0
+        for block, (wa, bl, width, height) in zip(blocks[start:start + cols], measured[start:start + cols]):
+            ca = x + wa / 2.0
+            cb = x + (wa + QC_COL_GAP if wa else 0) + bl
+            if first_b is None:
+                first_b = cb
+            for node, side, row in block:
+                if side == 'A' and node.Class() == 'Dot':
+                    _dag_place_center(node, x + 6, y + row * QC_ROW_STEP)
+                else:
+                    _dag_place_center(node, ca if side == 'A' else cb, y + row * QC_ROW_STEP)
+            x += width + QC_BLOCK_GAP
+            row_height = max(row_height, height)
+        right = max(right, x - QC_BLOCK_GAP)
+        y += row_height + QC_BLOCK_GAP
+    cb = first_b if first_b is not None else x0 + 40
+    rects = [_dag_node_rect(n) for block in blocks for n, _, _ in block]
+    if outs:
+        row_right = max(right, x0 + 400)
+        x = x0
+        for node in outs:
+            w = _dag_node_extent(node)[0]
+            if x > x0 and x + w > row_right:
+                x, y = x0, y + QC_ROW_STEP
+            node.setXYpos(int(x), int(y + 3))
+            rects.append(_dag_node_rect(node))
+            x += w + QC_COL_GAP
+        y += QC_ROW_STEP + QC_ROW_STEP // 2
+    for node in tail:
+        _dag_place_center(node, cb, y)
+        rects.append(_dag_node_rect(node))
+        y = rects[-1][3] + QC_ROW_STEP
+    if note is not None:
+        anchor = _dag_node_rect(tail[-1]) if tail else (x0, y0, right, y0)
+        top = _dag_node_rect(tail[0])[1] if tail else y0
+        note.setXYpos(int(anchor[2] + QC_COL_GAP), int(top))
+        rects.append(_node_rect(note))
+    return (min(r[0] for r in rects), min(r[1] for r in rects),
+            max(r[2] for r in rects), max(r[3] for r in rects)) if rects else (x0, y0, x0, y0)
+
+
+def layout_qc_review_groups(shots, tail=(), note=None, origin=(0, 0), outs=()):
+    """Lay out the per-shot QC Groups in rows of at most QC_COLS, each under its hidden-input Dots.
+
+    shots: per shot (group, dots), dots in Group input order (plate, edit[, region]). All entrance Dots of a
+    shot share one row, each straight above its own Group input (vertical wires).
+    tail (AppendClip, Write) is centred on the span of the Group tiles (same tile-centre axis); outs = per-shot hidden-input Dots laid in rows
+    right above the tail (used when there is more than one row of Groups); note goes beside the last
+    tail node. Returns the bounding rectangle of everything placed.
+    """
+    x0, y0 = origin
+    cols = max(1, min(QC_COLS, len(shots)))
+    rects = []
+    spans = []  # (left, right) of each Group tile: the tail centres on their overall span
+    y, right = y0, x0
+    for start in range(0, len(shots), cols):
+        x, bottom = x0, y
+        for grp, dots in shots[start:start + cols]:
+            tile = _dag_tile_width(grp)
+            cx = x + max(_dag_node_extent(grp)[0] / 2.0, tile / 2.0, 40)
+            # every entrance Dot on one row, straight above its own Group input (input k of n sits at (k + 0.5) / n of the tile)
+            # staggered rows (left Dot highest): a Dot label is drawn to the right of its Dot and would run over the next Dot's label on one row
+            for k, dot in enumerate(dots):
+                _dag_place_center(dot, cx - tile / 2.0 + tile * (k + 0.5) / len(dots), y + k * QC_DOT_STEP)
+            _dag_place_center(grp, cx, y + ((len(dots) - 1) * QC_DOT_STEP + QC_ROW_STEP if dots else 0))
+            spans.append((cx - tile / 2.0, cx + tile / 2.0))
+            column = [_dag_node_rect(n) for n in [grp] + list(dots)]
+            rects.extend(column)
+            x = max(r[2] for r in column) + QC_BLOCK_GAP
+            bottom = max(bottom, max(r[3] for r in column))
+        right = max(right, x - QC_BLOCK_GAP)
+        y = bottom + QC_BLOCK_GAP
+    if outs:
+        row_right = max(right, x0 + 400)
+        x = x0
+        for node in outs:
+            w = _dag_node_extent(node)[0]
+            if x > x0 and x + w > row_right:
+                x, y = x0, y + QC_ROW_STEP
+            node.setXYpos(int(x), int(y + 3))
+            rects.append(_dag_node_rect(node))
+            x += w + QC_COL_GAP
+        y += QC_ROW_STEP + QC_ROW_STEP // 2
+    cx = (min(s[0] for s in spans) + max(s[1] for s in spans)) / 2.0 if spans else (x0 + right) / 2.0
+    for node in tail:  # Group line -> AppendClip -> Write share one vertical axis (tile centres)
+        _dag_place_center(node, cx, y)
+        rects.append(_dag_node_rect(node))
+        y = rects[-1][3] + QC_ROW_STEP
+    if note is not None:
+        anchor = _dag_node_rect(tail[-1]) if tail else (x0, y0, right, y0)
+        top = _dag_node_rect(tail[0])[1] if tail else y0
+        note.setXYpos(int(anchor[2] + QC_COL_GAP), int(top))
+        rects.append(_node_rect(note))
+    return (min(r[0] for r in rects), min(r[1] for r in rects),
+            max(r[2] for r in rects), max(r[3] for r in rects)) if rects else (x0, y0, x0, y0)
+
+
+def qc_review_sticky_table(fmap):
+    """Shot ranges as a real table (a StickyNote label is Qt rich text): review | shot | EDIT (OUT) | PLATE.
+
+    fmap rows: (review first, review last, shot, out first, out last, plate first, plate last).
+    Frame ranges carry the 'f' marker and are right-aligned so the digits line up.
+    """
+    import html
+    head = (_t('리뷰', 'Review'), _t('샷', 'Shot'), _t('편집본 OUT', 'EDIT (OUT)'), _t('플레이트', 'PLATE'))
+    align = ('right', 'left', 'right', 'right')
+    rows = ['<tr>%s</tr>' % ''.join('<th align="%s">%s</th>' % (a, h) for a, h in zip(align, head))]
+    for a, b, shot, oa, ob, pa, pb in fmap:
+        cells = ('%d-%df' % (a, b), _qc_literal_text(html.escape(str(shot), quote=False)),
+                 '%d-%df' % (oa, ob), '%d-%df' % (pa, pb))
+        rows.append('<tr>%s</tr>' % ''.join('<td align="%s">%s</td>' % (al, c) for al, c in zip(align, cells)))
+    # Nuke sizes the note from its text lines and still grows it by about 10 px per table row, so the last row
+    # sits inside the box without any padding line (measured in Nuke 16.1 at zoom 1 and 2: 2 rows 116 px, 8 rows 212 px).
+    return '<table cellspacing="0" cellpadding="3">%s</table>' % ''.join(rows)
+
+
+def _qc_sticky_path(path):
+    """Output folder and file name on two short lines: the full path (often 120+ characters) made the sticky far wider than its table."""
+    import html
+    folder, name = os.path.split(str(path))
+    return '%s<br>%s' % (html.escape(os.path.basename(folder), quote=False), html.escape(name, quote=False))
+
+
+def _qc_input_dot(source, role, tag, own):
+    """Hidden-input Dot named after its source: the QC block reads the result tree without long wires."""
+    dot = own(nuke.nodes.Dot(name=_uname(_node_name('QC_in_%s_%s' % (role, tag))), hide_input=True))
+    _set(dot, 'hide_input', True)
+    dot.setInput(0, source)
+    try:
+        dot.setSelected(False)  # Nuke draws the hidden wire of a selected node: keep the fresh Dots unselected
+    except Exception:
+        pass
+    try:
+        name = str(source.name())
+        if name.startswith(NODE_PREFIX) and len(name) > len(NODE_PREFIX):  # the prefix adds width, not information
+            name = name[len(NODE_PREFIX):]
+        _set(dot, 'label', _qc_literal_text(name))
+    except Exception:
+        pass
+    return dot
+
+
 def build_review(entries, opts, ctx, owned_nodes=None):
     """QC review: guarded look match + RGB Difference by default, structure overlay optional.
     Information stays fixed; MP TC follows the saved source-TC ROI or manual placement.
@@ -16550,7 +19454,7 @@ def build_review(entries, opts, ctx, owned_nodes=None):
     log = ctx.log
     mode = qc_review_mode(opts)
     kind = 'jpeg' if str(opts.get('review_fmt', 'mov')).lower().startswith('j') else 'mov'
-    want_mp = bool(opts.get('review_mp_tc'))
+    want_mp = bool(opts.get('review_mp_tc', QC_MP_TC_DEFAULT))
     mono, cjk = _qc_fonts()
     big = max(entries, key=lambda e: e['edit'].format().width())
     Wf, Hf = qc_review_dimensions(big['edit'].format().width(),
@@ -16569,57 +19473,44 @@ def build_review(entries, opts, ctx, owned_nodes=None):
         nodes.append(node)
         return node
 
-    lasts, fmap = [], []
+    lasts, fmap, shots, inner_nodes = [], [], [], []
+    origin = tuple(opts.get('_layout_origin') or (0, 0))
     start = 1
     for i, e in enumerate(entries):
         ctx.progress(i / float(len(entries)), _t('QC 리뷰 구성 %d/%d', 'Building QC review %d/%d') % (i + 1, len(entries)))
-        tag = '%s_%d' % ((e['shot'] or e['plate'].name()).replace(' ', '_'), i + 1)
+        shot_name = e['shot'] or e['plate'].name()
+        shot_tag = '%s_%d' % (shot_name.replace(' ', '_'), i + 1)
+        tag = str(i + 1)  # short node names keep the columns narrow; the shot name is on the Group label
         E = len(e['res']['path'])
         of = e['out_first']
-        chain = []
-        me = own(nuke.nodes.MergeExpression(name=_uname(_node_name('QC_view_' + tag))))
-        _set(me, 'expr3', '1')
-        if mode == 'structure':
-            dim = own(nuke.nodes.Multiply(name=_uname(_node_name('QC_dim_' + tag))))
-            dim['value'].setValue(QC_DIM)
-            _set(dim, 'channels', 'rgb')
-            dim.setInput(0, e['edit_qc'])
-            dd = own(nuke.nodes.MergeExpression(name=_uname(_node_name('QC_lumdiff_' + tag))))
-            lum = '0.2126*(Br-Ar)+0.7152*(Bg-Ag)+0.0722*(Bb-Ab)'
-            for k in range(3):
-                _set(dd, 'expr%d' % k, lum)
-            _set(dd, 'expr3', '1')
-            dd.setInput(0, e['edit_qc'])
-            dd.setInput(1, e.get('plate_qc', e['tr']))
-            bl = own(nuke.nodes.Blur(name=_uname(_node_name('QC_lowpass_' + tag))))
-            bl['size'].setValue(max(2.0, QC_HP * e['edit'].format().width() / 1280.0))
-            bl.setInput(0, dd)
-            hp = own(nuke.nodes.MergeExpression(name=_uname(_node_name('QC_highpass_' + tag))))
-            for k in range(3):
-                _set(hp, 'expr%d' % k, 'Br-Ar')
-            _set(hp, 'expr3', '1')
-            hp.setInput(0, dd)
-            hp.setInput(1, bl)
-            for k, ch in enumerate('rgb'):
-                _set(me, 'expr%d' % k, 'B%s+min(max(abs(A%s)-%g,0)*%g,1)' % (ch, ch, QC_DEAD, QC_GAIN))
-            me.setInput(0, dim)
-            me.setInput(1, hp)
-            chain += [dim, dd, bl, hp]
-        else:
-            for k, ch in enumerate('rgb'):
-                _set(me, 'expr%d' % k, 'abs(A%s-B%s)' % (ch, ch))
-            me.setInput(0, e['edit_qc'])
-            me.setInput(1, e.get('plate_qc', e['tr']) if mode == 'matched_difference' else e['tr'])
-        if e.get('rr') is not None:  # split composite: add the difference only inside this plate's region (outside is the dark edit)
-            me.setInput(2, e['rr'])
-        rf = own(nuke.nodes.Reformat(name=_uname(_node_name('QC_fit_' + tag))))
-        _set(rf, 'type', 'to format')
-        _set(rf, 'format', fmt)
-        _set(rf, 'resize', 'fit')
-        _set(rf, 'center', True)
-        rf.setInput(0, me)
-        chain += [me, rf]
-        cur = rf
+        plate_src = e.get('plate_qc', e['tr']) if mode in ('matched_difference', 'structure') else e['tr']
+        # One Group per shot, fed by hidden-input Dots named after their sources (no long wires).
+        # Group inputs: 0 = plate (B), 1 = edit (A), 2 = region (split composite only).
+        dots = [_qc_input_dot(plate_src, 'plate', tag, own), _qc_input_dot(e['edit_qc'], 'edit', tag, own)]
+        if e.get('rr') is not None:
+            dots.append(_qc_input_dot(e['rr'], 'region', tag, own))
+        grp = own(nuke.nodes.Group(name=_uname(_node_name('QC_shot_' + tag))))
+        _set(grp, 'label', _qc_literal_text(shot_name))
+        _qc_add_knob(grp, 'Tab_Knob', 'nmmr_qc', 'NMMR QC')
+        _qc_add_knob(grp, 'Boolean_Knob', 'info_show', _t('정보 패널 표시', 'Show info panel'), True)
+        _qc_add_knob(grp, 'Double_Knob', 'info_opacity', _t('정보 바탕 불투명도 %', 'Info BG opacity %'),
+                     QC_INFO_OPACITY * 100, rng=(0, 100))
+        inner = []
+
+        def keep(node):
+            inner.append(node)
+            return node
+
+        # Inner layout: 'B' = main column (plate -> view -> overlays -> range, straight down the B pipe)
+        # 'A' = edit side on the left.
+        block = []
+        rows = dict(A=0, B=0)
+
+        def put(node, side, row=None):
+            row = rows[side] if row is None else row
+            block.append((node, side, row))
+            rows[side] = max(rows[side], row + 1)
+            return node
 
         # Saved TC region is in EDIT coordinates; map through the review's fit/letterbox.
         roi = e['res'].get('review_tc_roi')
@@ -16630,101 +19521,187 @@ def build_review(entries, opts, ctx, owned_nodes=None):
             roi = ((dx + roi[0] * ew * fit) / Wf, (dy + roi[1] * eh * fit) / Hf,
                    (dx + roi[2] * ew * fit) / Wf, (dy + roi[3] * eh * fit) / Hf)
         layout = qc_review_layout(Wf, Hf, opts, roi)
-        sz, pad, lh = layout['size'], layout['pad'], layout['line']
-        rect, rectm = layout['info'], layout['mp']
-        # Preserve the actual EDIT burn-in for direct TC comparison, not a Difference of it.
         if want_mp and layout['tc_known']:
-            ef = own(nuke.nodes.Reformat(name=_uname(_node_name('QC_tcfit_' + tag))))
-            for key, value in (('type', 'to format'), ('format', fmt), ('resize', 'fit'), ('center', True)):
-                _set(ef, key, value)
-            ef.setInput(0, e['edit_qc'])
-            mask = _qc_rect_node(None, layout['tc'], (1, 1, 1), 1,
-                                 _node_name('QC_tcmask_' + tag), nodes)
-            tc_copy = own(nuke.nodes.Merge2(name=_uname(_node_name('QC_tccopy_' + tag)), operation='copy'))
-            _set(tc_copy, 'operation', 'copy')
-            tc_copy.setInput(0, cur)
-            tc_copy.setInput(1, ef)
-            tc_copy.setInput(2, mask)
-            _set(tc_copy, 'channels', 'rgb')
-            chain += [ef, mask, tc_copy]
-            cur = tc_copy
-        l1, l2, warn, (pa, pb) = _qc_labels(e, mono, cjk)
-        look = e['res'].get('qc_look') or {}
-        status = qc_status_label(mode, look)
-        warn = status + (' | ' + warn if warn else '')
-        if want_mp and not layout['tc_known']:
-            warn += _t(' | TC 위치 미지정', ' | TC region not set')
-        e['review_layout'] = layout
-        e['corners'] = dict(shot='fixed', mp=layout['relation'] if want_mp else None)
-        x0, y0, x1, y1 = rect
-        max_chars = max(8, int((x1 - x0 - 2 * pad) / sz))
-        l1 = l1 if len(l1) <= max_chars else l1[:max_chars - 3] + '...'
-        rc = _qc_rect_node(cur, rect, (0, 0, 0), 0.62, _node_name('QC_labelbg_' + tag), nodes)
-        t1 = _qc_text_node(rc, _qc_literal_text(l1), (x0 + pad, y1 - pad - lh, x1 - pad, y1 - pad), True, True,
-                           sz, (1, 1, 1), cjk, _node_name('QC_label_' + tag), nodes)
-        t2 = _qc_text_node(t1, l2, (x0 + pad, y1 - pad - 2 * lh, x1 - pad, y1 - pad - lh), True, True,
-                          min(sz, (x1 - x0 - 2 * pad) / (80 * .62)), (1, 1, 1), mono,
-                          _node_name('QC_numbers_' + tag), nodes)
-        chain += [rc, t1, t2]
-        cur = t2
-        if warn:
-            tw_ = _qc_text_node(cur, _qc_literal_text(warn), (x0 + pad, y0 + pad, x1 - pad, y0 + pad + lh), True, False,
-                                min(sz, (x1 - x0 - 2 * pad) / max(_text_w(warn, 1), 1)),
-                                QC_WARN_RGB, cjk, _node_name('QC_warn_' + tag), nodes)
-            chain.append(tw_)
-            cur = tw_
-
-        # MP TC: the TC of the MP frame the retime picks for each output frame (computed from the actual TimeWarp keys)
+            _qc_add_knob(grp, 'Boolean_Knob', 'tc_copy_show', _t('EDIT TC 원본 보기', 'Show EDIT burn-in TC'), True)
         if want_mp:
-            strs, _, has_tc = _qc_mp_strings(e, log)
-            e['mp_strings'] = strs
-            szm = layout['mp_size']
-            mp_font = _qc_mp_font(opts, mono, log)
-            rcm = _qc_rect_node(cur, rectm, QC_MP_RGB, qc_mp_opacity(opts), _node_name('QC_mpbg_' + tag), nodes)
-            prefix_width = 3 * szm * .80
-            mp_low = qc_mp_text_low(opts)
-            prefix = _qc_mp_text_node(rcm, 'MP', (rectm[0] + pad, rectm[1] + pad,
-                                      rectm[0] + pad + prefix_width, rectm[3] - pad),
-                                     True, szm * .8, mp_font,
-                                     _node_name('QC_mpprefix_' + tag), nodes, mp_low)
-            msg = '[lindex {%s} [expr {int([frame]) - %d}]]' % (' '.join(strs), of)
-            tm = _qc_mp_text_node(prefix, msg, (rectm[0] + pad + prefix_width, rectm[1] + pad,
-                                              rectm[2] - pad, rectm[3] - pad),
-                                  False, szm, mp_font,
-                                  _node_name('QC_mptc_' + tag), nodes, mp_low)
-            chain += [rcm, prefix, tm]
-            cur = tm
-            if not has_tc:
-                log(_t('[%s] 플레이트 TC 없음 — MP 라벨은 프레임 번호(f…)로 표시', '[%s] No plate TC — MP label shows frame numbers (f...)') % e['plate'].name())
-        fr = own(nuke.nodes.FrameRange(first_frame=of, last_frame=of + E - 1,
-                                       name=_uname(_node_name('QC_range_' + tag))))
-        fr.setInput(0, cur)
-        chain.append(fr)
-        for k, n in enumerate(chain):
-            n.setXYpos((i % QC_COLS) * 130, (i // QC_COLS) * (len(chain) * 48 + 140) + k * 48)
-        lasts.append(fr)
-        fmap.append((start, start + E - 1, e['shot'] or e['plate'].name(), of, of + E - 1, pa, pb))
+            add_mp_label_knobs(grp, opts, _qc_mp_faces(opts, mono, lambda *_: None)[1], (Wf, Hf),
+                               height=qc_mp_label_height(layout))
+        grp.begin()
+        try:
+            plate_in = put(keep(nuke.nodes.Input(name='plate')), 'B', 0)
+            edit_in = put(keep(nuke.nodes.Input(name='edit')), 'A', 1)
+            region_in = put(keep(nuke.nodes.Input(name='region')), 'A', 0) if e.get('rr') is not None else None
+            me = keep(nuke.nodes.MergeExpression(name=_uname(_node_name('QC_view_' + tag))))
+            _set(me, 'expr3', '1')
+            if mode == 'structure':
+                # Inputs swapped against the earlier graph (B = plate side) with A/B swapped in the
+                # expressions, so every pixel value is unchanged.
+                dd = put(keep(nuke.nodes.MergeExpression(name=_uname(_node_name('QC_lumdiff_' + tag)))), 'B', 1)
+                lum = '0.2126*(Ar-Br)+0.7152*(Ag-Bg)+0.0722*(Ab-Bb)'
+                for k in range(3):
+                    _set(dd, 'expr%d' % k, lum)
+                _set(dd, 'expr3', '1')
+                dd.setInput(0, plate_in)
+                dd.setInput(1, edit_in)
+                dim = put(keep(nuke.nodes.Multiply(name=_uname(_node_name('QC_dim_' + tag)))), 'A', 2)
+                dim['value'].setValue(QC_DIM)
+                _set(dim, 'channels', 'rgb')
+                dim.setInput(0, edit_in)
+                bl = put(keep(nuke.nodes.Blur(name=_uname(_node_name('QC_lowpass_' + tag)))), 'A', 3)
+                bl['size'].setValue(max(2.0, QC_HP * e['edit'].format().width() / 1280.0))
+                bl.setInput(0, dd)
+                hp = put(keep(nuke.nodes.MergeExpression(name=_uname(_node_name('QC_highpass_' + tag)))), 'B', 3)
+                for k in range(3):
+                    _set(hp, 'expr%d' % k, 'Br-Ar')
+                _set(hp, 'expr3', '1')
+                hp.setInput(0, dd)
+                hp.setInput(1, bl)
+                for k, ch in enumerate('rgb'):
+                    _set(me, 'expr%d' % k, 'A%s+min(max(abs(B%s)-%g,0)*%g,1)' % (ch, ch, QC_DEAD, QC_GAIN))
+                me.setInput(0, hp)
+                me.setInput(1, dim)
+                put(me, 'B', 4)
+            else:
+                for k, ch in enumerate('rgb'):
+                    _set(me, 'expr%d' % k, 'abs(A%s-B%s)' % (ch, ch))  # symmetric: B = plate, A = edit
+                me.setInput(0, plate_in)
+                me.setInput(1, edit_in)
+                put(me, 'B', 1)
+            if region_in is not None:  # split composite: add the difference only inside this plate's region (outside is the dark edit)
+                me.setInput(2, region_in)
+            rf = put(keep(nuke.nodes.Reformat(name=_uname(_node_name('QC_fit_' + tag)))), 'B')
+            _set(rf, 'type', 'to format')
+            _set(rf, 'format', fmt)
+            _set(rf, 'resize', 'fit')
+            _set(rf, 'center', True)
+            rf.setInput(0, me)
+            cur = rf
+
+            sz, pad, lh = layout['size'], layout['pad'], layout['line']
+            rect = layout['info']
+            # Preserve the actual EDIT burn-in for direct TC comparison, not a Difference of it.
+            if want_mp and layout['tc_known']:
+                ef = keep(nuke.nodes.Reformat(name=_uname(_node_name('QC_tcfit_' + tag))))
+                for key, value in (('type', 'to format'), ('format', fmt), ('resize', 'fit'), ('center', True)):
+                    _set(ef, key, value)
+                ef.setInput(0, edit_in)
+                mask = _qc_rect_node(None, layout['tc'], (1, 1, 1), 1,
+                                     _node_name('QC_tcmask_' + tag), inner)
+                tc_copy = keep(nuke.nodes.Merge2(name=_uname(_node_name('QC_tccopy_' + tag)), operation='copy'))
+                _set(tc_copy, 'operation', 'copy')
+                tc_copy.setInput(0, cur)
+                tc_copy.setInput(1, ef)
+                tc_copy.setInput(2, mask)
+                _set(tc_copy, 'channels', 'rgb')
+                _qc_expr(tc_copy, 'disable', '1-parent.tc_copy_show')
+                put(ef, 'A', max(rows['A'], rows['B'] - 1))
+                put(tc_copy, 'B', max(rows['B'], rows['A']))
+                put(mask, 'A', rows['B'] - 1)
+                cur = tc_copy
+            l1, l2, warn, (pa, pb) = _qc_labels(e, mono, cjk)
+            look = e['res'].get('qc_look') or {}
+            status = qc_status_label(mode, look)
+            warn = status + (' | ' + warn if warn else '')
+            if want_mp and not layout['tc_known']:
+                warn += _t(' | TC 위치 미지정', ' | TC region not set')
+            e['review_layout'] = layout
+            e['corners'] = dict(shot='fixed', mp=layout['relation'] if want_mp else None)
+            x0, y0, x1, y1 = rect
+            max_chars = max(8, int((x1 - x0 - 2 * pad) / sz))
+            l1 = l1 if len(l1) <= max_chars else l1[:max_chars - 3] + '...'
+            rc = _qc_rect_node(cur, rect, (0, 0, 0), QC_INFO_OPACITY, _node_name('QC_labelbg_' + tag), inner)
+            _qc_expr(rc, 'opacity', 'parent.info_opacity/100')
+            t1 = _qc_text_node(rc, _qc_literal_text(l1), (x0 + pad, y1 - pad - lh, x1 - pad, y1 - pad), True, True,
+                               sz, (1, 1, 1), cjk, _node_name('QC_label_' + tag), inner)
+            t2 = _qc_text_node(t1, l2, (x0 + pad, y1 - pad - 2 * lh, x1 - pad, y1 - pad - lh), True, True,
+                               min(sz, (x1 - x0 - 2 * pad) / (80 * .62)), (1, 1, 1), mono,
+                               _node_name('QC_numbers_' + tag), inner)
+            info_nodes = [rc, t1, t2]
+            cur = t2
+            if warn:
+                tw_ = _qc_text_node(cur, _qc_literal_text(warn), (x0 + pad, y0 + pad, x1 - pad, y0 + pad + lh), True, False,
+                                    min(sz, (x1 - x0 - 2 * pad) / max(_text_w(warn, 1), 1)),
+                                    QC_WARN_RGB, cjk, _node_name('QC_warn_' + tag), inner)
+                info_nodes.append(tw_)
+                cur = tw_
+            for node in info_nodes:
+                _qc_expr(node, 'disable', '1-parent.info_show')
+                put(node, 'B')
+
+            # MP TC: the TC of the MP frame the retime picks for each output frame (computed from the actual TimeWarp keys)
+            if want_mp:
+                strs, _, has_tc = _qc_mp_strings(e, log)
+                e['mp_strings'] = strs
+                msg = '[lindex {%s} [expr {int([frame]) - %d}]]' % (' '.join(strs), of)
+                mpg = build_mp_label_group(cur, msg, layout, opts, mono, log, _node_name('QC_mp_' + tag), inner,
+                                           link_parent=True, label='MP TC' if has_tc else 'MP f#')
+                mpg.setInput(0, cur)
+                for key in ('translate', 'scale'):  # the shot Group's jack knobs -> this MP Group's Transform
+                    try:
+                        grp['mp_' + key].makeLink(mpg.name() + '.mp_xform', key)
+                    except Exception:
+                        pass
+                put(mpg, 'B')
+                cur = mpg
+                if not has_tc:
+                    log(_t('[%s] 플레이트 TC 없음 — MP 라벨은 프레임 번호(f…)로 표시', '[%s] No plate TC — MP label shows frame numbers (f...)') % e['plate'].name())
+            fr = keep(nuke.nodes.FrameRange(first_frame=of, last_frame=of + E - 1,
+                                            name=_uname(_node_name('QC_range_' + tag))))
+            fr.setInput(0, cur)
+            _set(fr, 'label', _qc_literal_text(shot_name))
+            put(fr, 'B')
+            out = put(keep(nuke.nodes.Output(name='Output1')), 'B')
+            out.setInput(0, fr)
+            layout_qc_review([block])  # inside the Group: same measured columns as before
+        finally:
+            grp.end()
+        for k, dot in enumerate(dots):
+            grp.setInput(k, dot)
+        inner_nodes.append((grp, inner))
+        shots.append((grp, dots))
+        layout_qc_review_groups(shots, origin=origin)  # place each shot at once: nothing waits at a default spot
+        lasts.append(grp)
+        fmap.append((start, start + E - 1, shot_name, of, of + E - 1, pa, pb))
         start += E
         log('[QC review] %s -> %d-%d | %s | info fixed | MP %s' % (
-            tag, fmap[-1][0], fmap[-1][1], mode, layout['relation'] if want_mp else 'off'))
+            shot_tag, fmap[-1][0], fmap[-1][1], mode, layout['relation'] if want_mp else 'off'))
 
     total = start - 1
-    rows = (len(entries) - 1) // QC_COLS
-    ybase = rows * (max(len(nodes) // max(len(entries), 1), 6) * 48 + 140) + 520
     ac = own(nuke.nodes.AppendClip(name=_uname(_node_name('QC_append'))))
+    outs = []
     for i, n in enumerate(lasts):
-        ac.setInput(i, n)
+        src = n
+        if len(lasts) > QC_COLS:
+            # more than one row of Groups: hidden-input Dot per shot right above AppendClip, so no wire
+            # crosses the Groups of the rows below
+            src = _qc_input_dot(n, 'out', str(i + 1), own)
+            _set(src, 'label', _qc_literal_text(fmap[i][2]))
+            outs.append(src)
+        ac.setInput(i, src)
     _set(ac, 'firstFrame', 1)
-    ac.setXYpos(0, ybase)
-    path = review_out_path(kind, opts.get('review_path'),
-                           __import__('datetime').datetime.now().strftime('%y%m%d_%H%M'),
-                           temp_path=opts.get('temp_path'))
+    rv_tag = _unique_review_tag(kind, opts.get('review_path'),
+                                __import__('datetime').datetime.now().strftime('%y%m%d_%H%M'),
+                                temp_path=opts.get('temp_path'))
+    path = review_out_path(kind, opts.get('review_path'), rv_tag, temp_path=opts.get('temp_path'))
     wr = own(nuke.nodes.Write(name=_uname(_node_name('QC_review_write'))))
     for k in ('beforeRender', 'afterRender', 'beforeFrameRender', 'afterFrameRender'):
         if k in wr.knobs():  # remove render callbacks planted by onCreate (auto backup, etc.)
             wr[k].setValue('')
     _set(wr, 'file_type', 'mov' if kind == 'mov' else 'jpeg')
     wr['file'].setValue(path)
+    studio, studio_info = {}, None
+    if opts.get('review_follow_writes', True):
+        # Follow the studio's existing Writes for the encoding of the format NMMR chose (never via createNode
+        # a studio onUserCreate hook may write backups or publish).
+        try:
+            known = set(wr.knobs())
+        except Exception:
+            known = None
+        studio, studio_info = infer_studio_write_settings(
+            _studio_write_nodes(), 'mov' if kind == 'mov' else 'jpeg', _ocio_colorspace_names(),
+            _studio_write_defaults('mov' if kind == 'mov' else 'jpeg'), known)
+    # never render through a LUT the active config lacks
+    cs_set = configure_review_write_colorspace(wr, log, preferred=studio.get('colorspace'))
     _set(wr, 'create_directories', True)
     _set(wr, 'channels', 'rgb')
     if kind == 'mov':
@@ -16733,14 +19710,25 @@ def build_review(entries, opts, ctx, owned_nodes=None):
         _set(wr, 'mov64_quality', 'High')
     else:
         _set(wr, '_jpeg_quality', 0.9)
+    if studio_info is not None:
+        applied = apply_studio_write_settings(wr, studio)
+        if studio.get('colorspace') and cs_set and \
+                _colorspace_entry_name(cs_set) == _colorspace_entry_name(studio['colorspace']):
+            applied = dict([('colorspace', _colorspace_entry_name(cs_set))] + list(applied.items()))
+        log(studio_write_message(applied, studio_info))
     wr.setInput(0, ac)
-    wr.setXYpos(0, ybase + 80)
-    wr['label'].setValue('QC review %s  %d frames' % (kind.upper(), total))
-    sticky = own(nuke.nodes.StickyNote(label='QC review  %d shots / %d frames  %s %dx%d<br>%s<br><br>%s' % (
-        len(entries), total, kind.upper(), Wf, Hf, path, '<br>'.join(
-            'review %d-%d  %s  OUT %d-%d  PLATE %d-%d' % m for m in fmap))))
-    sticky.setXYpos(200, ybase)
-    return dict(write=wr, nodes=nodes, frames=total, path=path, kind=kind, fmt=(Wf, Hf), map=fmap)
+    if qc_write_only(opts):
+        # A farm render follows the project range (root 1-207 renders 17 frames past the clip), so pin the Write to the clip.
+        _set(wr, 'use_limit', True)
+        _set(wr, 'first', 1)
+        _set(wr, 'last', total)
+    wr['label'].setValue(_singular('QC review %s  %d frames' % (kind.upper(), total)))
+    # _singular only on the count header: the table carries ranges, and shot names are user text
+    sticky = own(nuke.nodes.StickyNote(label=_singular('QC review  %d shots / %d frames  %s %dx%d' % (
+        len(entries), total, kind.upper(), Wf, Hf)) + '<br>%s<br><br>%s' % (_qc_sticky_path(path), qc_review_sticky_table(fmap))))
+    layout_qc_review_groups(shots, (ac, wr), sticky, origin, outs=outs)
+    return dict(write=wr, nodes=nodes, frames=total, path=path, kind=kind, fmt=(Wf, Hf), map=fmap,
+                groups=inner_nodes)
 
 
 def _review_jpegs(path):
@@ -16752,7 +19740,8 @@ def _review_jpegs(path):
 
 
 def render_review(info, ctx):
-    """ Write render. MOV = Nuke progress window / JPEG = progress bar updated every 24 frames. Cancel -> Cancelled"""
+    """ Write render. MOV = Nuke progress window / JPEG = progress bar updated every 24 frames.
+    Cancel -> Cancelled; any other render error is raised as it is"""
     wr, N, kind = info['write'], info['frames'], info['kind']
     ctx.progress(0.0, _t('QC 리뷰 렌더 중 (%d프레임)…', 'Rendering QC review (%d frames)...') % N)
     try:
@@ -16761,12 +19750,18 @@ def render_review(info, ctx):
                 if ctx.cancelled():
                     raise Cancelled(_t('QC 리뷰 렌더 취소', 'QC review render cancelled'))
                 b = min(N, a + QC_JPEG_CHUNK - 1)
-                nuke.execute(wr, a, b, 1)
+                with _frame_heartbeat():
+                    nuke.execute(wr, a, b, 1)
                 ctx.progress(b / float(N), _t('QC 리뷰 렌더 %d/%d', 'QC review render %d/%d') % (b, N))
         else:
-            nuke.execute(wr, 1, N, 1)
+            with _frame_heartbeat():
+                nuke.execute(wr, 1, N, 1)
     except RuntimeError as e:
-        raise Cancelled(_t('QC 리뷰 렌더 중단: %s', 'QC review render interrupted: %s') % e)
+        # Only a cancel is reported as cancelled (the window's Cancel, or Nuke's own progress Cancel, which raises
+        # 'Cancelled'). Any other render error (no write permission, disk full, codec) stays a failure.
+        if ctx.cancelled() or str(e).strip().lower() in ('cancelled', 'canceled'):
+            raise Cancelled(_t('QC 리뷰 렌더 중단: %s', 'QC review render interrupted: %s') % e)
+        raise
     path = info['path']
     if kind == 'mov':
         ok = os.path.isfile(path) and os.path.getsize(path) > 0
@@ -16816,7 +19811,61 @@ def qc_read_position(anchor_rects, obstacle_rects, w, h, gap=QC_READ_GAP, margin
     return int(x), int(y)
 
 
-def create_review_read(path, frames, colorspace, anchors, log=print):
+def qc_read_position_in_block(anchors, read_rect):
+    """Result block (user reference 2026-11-07): the QC review Read goes inside the backdrop, in the column right of
+    the output tree under the result note, level with the QC section. With several shots (a batch) it goes into the
+    block of the last shot (the batch review Read no longer uses this: see create_review_read). Returns (x, y, grow_w, grow_h): the backdrop(s) around that block must grow by
+    grow_w x grow_h to hold it. None when there is no single QC block to attach to."""
+    boards = [n for n in anchors if n.Class() == 'BackdropNode']
+    body = [n for n in anchors if n.Class() != 'BackdropNode']
+    diffs = [n for n in body if n.Class() == 'Merge2' and _node_name_startswith(n, 'QC_diff_')]
+    if not boards or not diffs:
+        return None
+    diff = diffs[-1]
+    dx, dy = int(diff.xpos()), int(diff.ypos())
+    holders = [(((r[2] - r[0]) * (r[3] - r[1])), b) for b, r in ((b, _node_rect(b)) for b in boards)
+               if r[0] <= dx <= r[2] and r[1] <= dy <= r[3]]
+    if not holders:
+        return None
+    board = min(holders, key=lambda h: h[0])[1]  # innermost backdrop around the QC Difference
+    br = _node_rect(board)
+    block = [n for n in body if br[0] <= int(n.xpos()) <= br[2] and br[1] <= int(n.ypos()) <= br[3]]
+    notes = [n for n in block if n.Class() == 'StickyNote']
+    others = [n for n in block if n.Class() != 'StickyNote']
+    w, h = read_rect[2] - read_rect[0], read_rect[3] - read_rect[1]
+    x = int(notes[0].xpos()) if notes else int(max(_tile_rect(n)[2] for n in others) + 12)
+    y_min = int(max(_node_rect(n)[3] for n in notes)) + QC_READ_MARGIN if notes else dy + 56
+    y = max(dy + 56, y_min)
+    y = max(y_min, min(y, br[3] - QC_READ_MARGIN - h))  # prefer the QC section height, but stay inside when it fits
+    for _ in range(len(block) + 1):
+        hit = [r for r in (_tile_rect(n) for n in block)
+               if x < r[2] and x + w > r[0] and y < r[3] + QC_READ_MARGIN and y + h > r[1] - QC_READ_MARGIN]
+        if not hit:
+            break
+        y = max(r[3] for r in hit) + QC_READ_MARGIN
+    grow_h = max(0, y + h + QC_READ_MARGIN - br[3])
+    grow_w = max(0, x + w + BD_PAD[2] - br[2])
+    return x, y, grow_w, grow_h
+
+
+def _grow_backdrops(anchors, around, grow_w, grow_h):
+    """Enlarge every backdrop that contains the `around` point (the block's own backdrop and any batch backdrop)."""
+    if not (grow_w or grow_h):
+        return
+    px, py = int(around.xpos()), int(around.ypos())
+    for b in anchors:
+        if b.Class() != 'BackdropNode':
+            continue
+        r = _node_rect(b)
+        if r[0] <= px <= r[2] and r[1] <= py <= r[3]:
+            try:
+                b['bdwidth'].setValue(int(b['bdwidth'].value()) + int(grow_w))
+                b['bdheight'].setValue(int(b['bdheight'].value()) + int(grow_h))
+            except Exception:
+                pass
+
+
+def create_review_read(path, frames, colorspace, anchors, log=print, batch=False):
     """ create a Read for the rendered QC review below the result tree (not selected). None on failure (the render result stays)"""
     try:
         rd = create_user_read(path, 0, 0)  # same format as a user-made Read (fromUserText fills the format, etc.)
@@ -16827,10 +19876,26 @@ def create_review_read(path, frames, colorspace, anchors, log=print):
         _set(rd, 'origlast', int(frames))
         if colorspace and not _is_default_colorspace(colorspace):
             _set(rd, 'colorspace', colorspace)
-        rd['label'].setValue(qc_read_label(frames))
+        # Label, tile colour and fonts stay whatever the user's onUserCreate / knobDefault gave this Read.
         rd.setSelected(False)
         anchors = [n for n in (anchors or ()) if n is not None]
         boards = [n for n in anchors if n.Class() == 'BackdropNode'] or anchors
+        try:
+            tile_w = max(int(rd.screenWidth()), 80)
+        except Exception:
+            tile_w = 80
+        try:
+            tile_h = max(int(rd.screenHeight()), 150)
+        except Exception:
+            tile_h = 160
+        # A batch review is a product of the whole batch: it goes under the shot grid (inside the batch
+        # backdrop), never into the last shot's own backdrop.
+        inside = None if batch else qc_read_position_in_block(anchors, (0, 0, tile_w, tile_h))
+        if inside is not None:
+            rd.setXYpos(inside[0], inside[1])
+            diffs = [n for n in anchors if n.Class() == 'Merge2' and _node_name_startswith(n, 'QC_diff_')]
+            _grow_backdrops(anchors, diffs[-1], inside[2], inside[3])
+            return rd
         own = set(n.fullName() for n in boards) | set([rd.fullName()])
         obstacles = []
         for n in nuke.allNodes():
@@ -16849,7 +19914,58 @@ def create_review_read(path, frames, colorspace, anchors, log=print):
         return None
 
 
-def make_review(entries, opts, ctx, anchors=None):
+def review_origin(anchors, inside=False, beside=False):
+    """Top-left for the QC review graph: right below this run's results, or None.
+    inside=True: the graph will be enclosed by the result backdrop (grown afterwards), so no room for its own label.
+    beside=True: in the empty spot to the right of the results (top-aligned) instead of under them. The 'near the plates'
+    batch mode uses it so the graph does not end up under the lowest result block, far from the other shots."""
+    try:
+        rects = [_node_rect(n) for n in (anchors or ()) if n is not None]
+    except Exception:
+        return None
+    if not rects:
+        return None
+    if beside:
+        return max(r[2] for r in rects) + QC_BLOCK_GAP, min(r[1] for r in rects) + BD_PAD[1]
+    return min(r[0] for r in rects), max(r[3] for r in rects) + QC_BLOCK_GAP + (0 if inside else BD_PAD[1])
+
+
+def _grow_result_backdrop(anchors, nodes):
+    """Stretch the result backdrop(s) of this run down and right so they enclose the freshly built QC graph."""
+    try:
+        mine = [_node_rect(n) if n.Class() == 'StickyNote' else _dag_node_rect(n) for n in nodes if n is not None]
+        boards = [n for n in (anchors or ()) if n is not None and n.Class() == 'BackdropNode']
+        if not mine or not boards:
+            return
+        need_x, need_y = max(r[2] for r in mine) + BD_PAD[2], max(r[3] for r in mine) + BD_PAD[3]
+        for b in boards:
+            r = _node_rect(b)
+            b['bdwidth'].setValue(max(int(b['bdwidth'].value()), need_x - r[0]))
+            b['bdheight'].setValue(max(int(b['bdheight'].value()), need_y - r[1]))
+    except Exception:
+        pass  # placement only; the review itself is unaffected
+
+
+def _move_review_below(nodes, anchors, inside=False, free=False, beside=False):
+    """Shift the freshly built QC review graph right below (beside=True: to the right of) this run's results
+    instead of over the user's nodes."""
+    try:
+        own = [n for n in nodes if n is not None]
+        origin = review_origin(anchors, inside=inside, beside=beside)
+        if origin is None or not own:
+            return
+        mine = [_node_rect(n) if n.Class() == 'StickyNote' else _dag_node_rect(n) for n in own]  # text footprint, as the backdrop growth uses
+        dx = origin[0] - min(r[0] for r in mine)
+        dy = origin[1] - min(r[1] for r in mine)
+        for n in own:
+            n.setXYpos(int(n.xpos()) + int(dx), int(n.ypos()) + int(dy))
+        if free:  # scattered results: move the graph only as far as needed to leave other nodes alone
+            place_free(own, avoid_backdrops=True)
+    except Exception:
+        pass  # placement only; the review itself is unaffected
+
+
+def make_review(entries, opts, ctx, anchors=None, batch=False):
     """ build the review nodes (empty spot + 'QC Review · N shots' backdrop, included in the calling undo group) + render.
     The retime result stays even on failure. Returns dict(ok, path, kind, frames, shots, [error | cancelled])"""
     if not entries:
@@ -16860,21 +19976,30 @@ def make_review(entries, opts, ctx, anchors=None):
 
     def group_label():
         if info:
-            return '%s  %dx%d  %d frames' % (
-                info['kind'].upper(), info['fmt'][0], info['fmt'][1], info['frames'])
+            return _singular('%s  %dx%d  %d frames' % (
+                info['kind'].upper(), info['fmt'][0], info['fmt'][1], info['frames']))
         return _t('리뷰 구성/렌더 미완료', 'Review setup/render incomplete')
 
     def group_failed(reason):
         wrapped = RuntimeError(reason)
         wrapped.nmmr_owned_nodes = tuple(review_nodes)
         return finalize_failed_owned(wrapped, group_label(), ctx.log,
-                                     head='QC Review · %d shots' % len(entries))
+                                     head=_singular('QC Review · %d shots' % len(entries)))
 
     try:
         nuke.root()['proxy'].setValue(False)
         try:
-            info = build_review(entries, opts, ctx, review_nodes)
-            path = render_review(info, ctx)
+            keep_in_block = qc_write_only(opts) and not batch  # Write-only single run: the graph stays inside the result backdrop
+            near_batch = batch and batch_place_mode(opts.get('batch_place')) == 'near'
+            origin = review_origin(anchors, inside=keep_in_block, beside=near_batch)
+            info = build_review(entries, dict(opts, _layout_origin=origin) if origin else opts, ctx, review_nodes)
+            _move_review_below(info.get('nodes') or (), anchors, inside=keep_in_block, free=near_batch, beside=near_batch)
+            if keep_in_block:
+                _grow_result_backdrop(anchors, info.get('nodes') or ())
+            if qc_write_only(opts):
+                path = info['path']  # Write-only: nothing is rendered here
+            else:
+                path = render_review(info, ctx)
         except Cancelled as e:
             backdrop = group_failed(_t('QC 리뷰 렌더 취소', 'QC review render cancelled'))
             ctx.log(str(e) or _t('QC 리뷰 취소', 'QC review cancelled'))
@@ -16887,6 +20012,15 @@ def make_review(entries, opts, ctx, anchors=None):
             ctx.log(_t('QC 리뷰 실패: %s', 'QC review failed: %s') % e)
             return dict(ok=False, error=str(e), path=info and info['path'],
                         _owned_nodes=list(review_nodes) + ([backdrop] if backdrop is not None else []))
+        if qc_write_only(opts):
+            # Render-farm mode: keep the whole review graph (shot groups + AppendClip + Write) and render nothing.
+            ctx.log(_t('QC 리뷰 Write 노드만 만들었습니다 (렌더 안 함). 렌더팜에서 렌더하세요: Write "%s" → %s (%d프레임)',
+                       'QC review Write created without rendering. Render it on the farm: Write "%s" -> %s (%d frames)')
+                    % (info['write'].name(), path, info['frames']))
+            ctx.progress(1.0, _t('QC 리뷰 Write 생성 (렌더 안 함)', 'QC review Write created (not rendered)'))
+            return dict(ok=True, write_only=True, path=path, reveal='', kind=info['kind'], frames=info['frames'],
+                        shots=len(entries), map=info['map'], write=info['write'].name(), removed_nodes=0,
+                        read='', _owned_nodes=list(review_nodes))
         # the review build nodes (AppendClip, Write, labels, etc.) left after rendering were a separate 'QC Review' cluster in an empty spot beside the result.
         # The product is the render file and the QC Difference stays in the result tree, so delete them on success (kept for diagnosis on failure / cancel)
         write_name = info['write'].name()
@@ -16899,7 +20033,7 @@ def make_review(entries, opts, ctx, anchors=None):
         ctx.log(_t('QC 리뷰 구성 노드 정리: %d개 (렌더 파일만 남김)', 'QC review setup nodes removed: %d (only the rendered file is kept)') % removed)
         ctx.log(_t('QC 리뷰 저장: %s (%d프레임)', 'QC review saved: %s (%d frames)') % (path, info['frames']))
         ctx.progress(1.0, _t('QC 리뷰 저장 완료', 'QC review saved'))
-        read = create_review_read(path, info['frames'], write_cs, anchors, ctx.log)
+        read = create_review_read(path, info['frames'], write_cs, anchors, ctx.log, batch=batch)
         reveal = path
         if info['kind'] == 'jpeg':  # for a sequence, select the first frame in Finder
             jp = _review_jpegs(path)
@@ -16935,6 +20069,9 @@ def reveal_in_file_manager(path):
 
 # integrated GUI (single / batch / filmstrip / lagging-TC calibration)
 _WIN = None
+# A new object on every execution of this file (re-paste in the Script Editor, module reload). Windows built by an
+# earlier execution carry an older token, so show_window never reuses their stale code.
+_MODULE_TOKEN = object()
 
 # UI tokens - Nuke dark tone + a single accent color (blue). Exclusion = red, pin = yellow are used only as semantic colors
 _UI = dict(
@@ -17008,6 +20145,11 @@ QLineEdit[error="true"] { border-color: @err; }
 QComboBox:hover { background-color: @field_hi; }
 QComboBox::drop-down { border: none; width: 22px; }
 QComboBox::down-arrow { image: url(@chev); width: 10px; height: 10px; }
+QComboBox#langpill { background-color: #343434; border: 1px solid #3f3f3f; border-radius: 13px;
+    padding: 2px 4px 2px 14px; min-height: 21px; max-height: 21px; }
+QComboBox#langpill:hover { background-color: #3a3a3a; }
+QComboBox#langpill:focus { border-color: @accent; }
+QComboBox#langpill::drop-down { border: none; width: 18px; }
 QComboBox QAbstractItemView { background-color: #262626; border: 1px solid #474747; outline: 0;
     selection-background-color: @accent_bg; padding: 2px; }
 QSpinBox::up-button, QSpinBox::down-button { width: 0; border: none; }
@@ -17061,7 +20203,7 @@ _OPT_TIPS = {
             '정수 프레임 편집에는 분수 룩업을 만들지 않습니다',
     'cleanup': '작업이 끝나면 이번 실행에서 만든 썸네일 캐시를 지웁니다.\n'
                '끄면 남겨 두고 재실행할 때 재사용합니다 (7일 지난 캐시는 항상 자동 정리)',
-    'qc': 'EDIT 와 리타임 결과를 겹쳐 보는 difference QC 트리를 만듭니다',
+    'qc': 'EDIT 와 리타임 결과를 겹쳐 보는 difference QC 노드 세트를 만듭니다',
     'qc_look': 'Beta · 기본 켬. 신뢰 프레임에서 한 샷의 고정 Grade를 추정하고 별도 프레임으로 검증합니다.\n'
                '검증을 통과하면 출력 트리 끝(Transform 뒤)에 켜진 Grade를 붙이고 QC Difference도 그 뒤를 비교합니다. 이 Grade는 QC Difference를 더 또렷하게 보기 위한 룩 매치이며 편집본 룩으로 출력하려는 것이 아닙니다. 원본 톤으로 렌더하려면 Grade를 disable 하세요.\n'
                '로컬 추가 렌더로 시간이 늘어나며 분할합성·영역 분석·근거 부족이면 보류합니다. 프레임 정확도 검증을 대체하지 않습니다.',
@@ -17071,7 +20213,7 @@ _OPT_TIPS = {
     'reframe_output': '고급 베타 기능. 검증된 옵티컬 결과를 EDIT 포맷 width-fit 기준의 별도 Transform 으로 출력합니다.\n'
                       '가변 리프레임은 프레임별 scale/translate 키, 고정 리프레임은 정적 scale/translate 값을 만듭니다.\n'
                       'QC 가 꺼져 있어도 결과 Transform 을 만들며, QC 가 켜져 있으면 같은 Transform 을 재사용합니다.\n'
-                      'QC 위치 정밀화를 켜면 QC 트리 생성 여부와 관계없이 검증된 정적 보정값을 반영합니다.\n'
+                      'QC 위치 정밀화를 켜면 QC 노드 세트 생성 여부와 관계없이 검증된 정적 보정값을 반영합니다.\n'
                       '옵티컬 감지가 꺼졌거나 분할합성 모드이면 출력을 보류합니다. 추적을 끄면 정적 Transform 만 만듭니다.',
     'qc_refine': '고정 리프레임에만 최대 8개 앵커를 512px로 추가 렌더해 위치·배율 보정. 처리 시간이 늘어납니다. '
                  '가변 리프레임은 기존 추적을 유지합니다.'}
@@ -17285,6 +20427,34 @@ def _apply_window_stay_on_top(window, Qt, on):
             window.setAttribute(Qt.WA_ShowWithoutActivating, show_without_activation)
 
 
+class _RoleUI(dict):
+    """role -> (color, label). One table for every path-token name shown to the user (blocks, legend,
+    [Shot]-style path previews, test output). The label is rendered when read, so it follows the current
+    UI language instead of the language the window classes were built in."""
+    def __getitem__(self, role):
+        color, label = dict.__getitem__(self, role)
+        return color, label()
+
+    def get(self, role, default=None):
+        return self[role] if role in self else default
+
+    def items(self):
+        return [(role, self[role]) for role in self]
+
+    def values(self):
+        return [self[role] for role in self]
+
+
+class _Rendered(object):
+    """Class attribute rendered each time it is read (on the class or an instance), so labels built from _t()
+    follow a language switch."""
+    def __init__(self, make):
+        self._make = make
+
+    def __get__(self, obj, owner=None):
+        return self._make()
+
+
 def _mk_window_classes(QtWidgets, QtCore, QtGui):
     """
     full UI cleanup - header chips / rich source combo / segments / timeline transport / exclusion and pin chips / footer status
@@ -17303,6 +20473,8 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
     def _authored_text(text):
         """Translate only exact authored copy; unknown/dynamic text may contain user filenames."""
         text = str(text or '')
+        if _T_PAIRS.get(text):  # text made by _t(ko, en): re-render the same pair
+            return _t_rendered(text)
         reverse = dict((en, ko) for ko, en in _UI_TEXT_EN.items())
         if ui_language() == 'en':
             return _english_authored_text(text)
@@ -17314,7 +20486,10 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
         if record is None or str(current) != record[1]:
             record = (str(current or ''), None)
         source = record[0]
-        rendered = source if ui_language() == 'ko' else _english_authored_text(source)
+        if _T_PAIRS.get(source):  # text made by _t(ko, en): re-render the same pair
+            rendered = _t_rendered(source)
+        else:
+            rendered = source if ui_language() == 'ko' else _english_authored_text(source)
         cache[name] = (source, rendered)
         widget._nmmr_i18n_properties = cache
         return rendered
@@ -17348,7 +20523,10 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
                     item = widget.horizontalHeaderItem(col)
                     if item is not None:
                         item.setText(_authored_text(item.text()))
-        for action in root.findChildren(QtGui.QAction):
+                        if item.toolTip():
+                            item.setToolTip(_authored_text(item.toolTip()))
+        # PySide6 (Nuke 16) keeps QAction in QtGui; PySide2 (Nuke 15) keeps it in QtWidgets.
+        for action in root.findChildren(getattr(QtGui, 'QAction', None) or QtWidgets.QAction):
             action.setText(_authored_text(action.text()))
             if action.toolTip():
                 action.setToolTip(_authored_text(action.toolTip()))
@@ -17541,6 +20719,38 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
                            fs.elidedText(sec, Qt.ElideRight, rest))
         p.restore()
 
+    class ShimmerBar(QtWidgets.QProgressBar):
+        """Progress bar with a light band sweeping over the filled part while the run is alive. Bar size, range and style are unchanged."""
+
+        def __init__(self, parent=None):
+            QtWidgets.QProgressBar.__init__(self, parent)
+            self._shimmer = None  # None = off, else 0..1 band position
+
+        def set_shimmer(self, phase):
+            if phase != self._shimmer:
+                self._shimmer = phase
+                self.update()
+
+        def paintEvent(self, event):
+            QtWidgets.QProgressBar.paintEvent(self, event)
+            lo, hi = self.minimum(), self.maximum()
+            if self._shimmer is None or hi <= lo:
+                return
+            w = int(self.width() * (self.value() - lo) / float(hi - lo))
+            if w < 6:
+                return
+            band = max(24, w // 4)
+            x = -band + (w + band) * self._shimmer
+            grad = QtGui.QLinearGradient(x, 0, x + band, 0)
+            clear, glow = QtGui.QColor(255, 255, 255, 0), QtGui.QColor(255, 255, 255, 110)
+            grad.setColorAt(0.0, clear)
+            grad.setColorAt(0.5, glow)
+            grad.setColorAt(1.0, clear)
+            p = QtGui.QPainter(self)
+            p.setClipRect(0, 0, w, self.height())
+            p.fillRect(QtCore.QRectF(x, 0, band, self.height()), QtGui.QBrush(grad))
+            p.end()
+
     class RichDelegate(QtWidgets.QStyledItemDelegate):
         """combo popup / split-composite list: 2 lines of file name (main) + node name and frame range (secondary), server entries get a badge"""
 
@@ -17654,7 +20864,7 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             return QtCore.QSize(min(44, self.sizeHint().width()), s.height())
 
         def setText(self, t):
-            self._full = t or ''
+            self._full = _singular(t or '')
             self.setToolTip((self._full + self._suffix) if self._full else '')
             self._elide()
 
@@ -19021,9 +22231,11 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
                 p.end()
 
     # path block bar (easy setup)
-    ROLE_UI = {'project': ('#5f9cf0', _t('프로젝트', 'Project')), 'seq': ('#b48cf0', _t('시퀀스', 'Sequence')), 'shot': ('#e8a63e', _t('샷', 'Shot')),
-               'layer': ('#4fb8a8', _t('레이어', 'Layer')), 'version': ('#7cc47f', _t('버전', 'Version')), 'any': ('#9a9a9a', _t('아무거나', 'Any')),
-               'frame': ('#6f6f6f', _t('프레임 번호', 'Frame number')), 'root': ('#9a9a9a', _t('루트', 'Root')), 'ext': ('#6f6f6f', _t('확장자', 'Extension'))}
+    ROLE_UI = _RoleUI({'project': ('#5f9cf0', lambda: _t('프로젝트', 'Project')), 'seq': ('#b48cf0', lambda: _t('시퀀스', 'Sequence')),
+                       'shot': ('#e8a63e', lambda: _t('샷', 'Shot')), 'layer': ('#4fb8a8', lambda: _t('레이어', 'Layer')),
+                       'version': ('#7cc47f', lambda: _t('버전', 'Version')), 'any': ('#9a9a9a', lambda: _t('아무거나', 'Any')),
+                       'frame': ('#6f6f6f', lambda: _t('프레임 번호', 'Frame number')), 'root': ('#9a9a9a', lambda: _t('루트', 'Root')),
+                       'ext': ('#6f6f6f', lambda: _t('확장자', 'Extension'))})
 
     class BlockBar(QtWidgets.QWidget):
         """Show the path as side-by-side folder blocks, with each block's role shown by color and text. Click / Enter = role menu, left/right = move between blocks.
@@ -19288,7 +22500,7 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
 
         def __init__(self, parent=None):
             QtWidgets.QDialog.__init__(self, parent)
-            self.setWindowTitle(_t('경로 설정 — No More Manual Retime', 'Path setup — No More Manual Retime'))
+            self.setWindowTitle(_t('설정 — No More Manual Retime', 'Settings — No More Manual Retime'))
             self.setStyleSheet(css + (
                 'QPlainTextEdit#tmpl { background-color: %s; border: 1px solid %s; border-radius: 4px; padding: 2px 4px;'
                 ' font-family: Menlo, Consolas, monospace; font-size: 11px; }'
@@ -19306,6 +22518,22 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             lay = QtWidgets.QVBoxLayout(self)
             lay.setContentsMargins(12, 12, 12, 12)
             lay.setSpacing(8)
+            lr = QtWidgets.QHBoxLayout()  # language first: it applies to the whole tool, not to the path templates
+            lr.setSpacing(8)
+            lb_language = QtWidgets.QLabel(_t('언어 / Language', 'Language'))
+            lb_language.setObjectName('field')
+            lr.addWidget(lb_language)
+            self.cb_language = QtWidgets.QComboBox()
+            self.cb_language.setAccessibleName('Language')
+            self.cb_language.setObjectName('langpill')  # pill like the header context chip
+            self.cb_language.setToolTip(_t('언어 / Language\n바꾸면 이 창과 열려 있는 창에 바로 적용되고 저장됩니다\n[닫기]로 설정을 저장하지 않고 닫아도 언어는 바뀐 채로 남습니다', 'Language\nApplied at once to this window and every open window, and remembered.\nIt stays changed even when you close Settings without saving.'))
+            self.cb_language.addItem('KO', 'ko')
+            self.cb_language.addItem('EN', 'en')
+            self.cb_language.setCurrentIndex(0 if ui_language() == 'ko' else 1)
+            self.cb_language.currentIndexChanged.connect(self._language_changed)
+            lr.addWidget(self.cb_language)
+            lr.addStretch(1)
+            lay.addLayout(lr)
             mr = QtWidgets.QHBoxLayout()  # [Easy setup | Developer mode] - both edit the same settings
             mr.setSpacing(0)
             self.b_easy = QtWidgets.QPushButton(_t('쉬운 설정', 'Easy setup'))
@@ -19322,6 +22550,8 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
                 mr.addWidget(b)
             grp.idClicked.connect(lambda i: self._set_mode(i == 1)) if hasattr(grp, 'idClicked') else \
                 grp.buttonClicked[int].connect(lambda i: self._set_mode(i == 1))
+            self._seg_labels = tuple((seg, _T_PAIRS.get(seg.text()) or (seg.text(),)) for seg in (self.b_easy, self.b_dev))  # both language labels of each segment
+            self._fit_segments()
             mr.addSpacing(12)
             self.lb_mode = QtWidgets.QLabel('')
             self.lb_mode.setObjectName('dim')
@@ -19341,7 +22571,7 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             dl = QtWidgets.QVBoxLayout(dev)
             dl.setContentsMargins(0, 0, 0, 0)
             dl.setSpacing(8)
-            info = QtWidgets.QLabel(self._files_text())
+            info = self.lb_files = QtWidgets.QLabel(self._files_text())
             info.setObjectName('dim')
             info.setWordWrap(True)
             info.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -19398,8 +22628,8 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             }
             self._field_tips = {}
             for r, (keys, label, kind, tip) in enumerate(self.FIELDS):
-                if ui_language() == 'en':
-                    label, tip = field_en.get(keys, (label, tip))
+                if keys in field_en:  # _t pair, so a language switch re-renders label and tip
+                    label, tip = _t(label, field_en[keys][0]), _t(tip, field_en[keys][1])
                 self._field_tips[keys] = tip
                 fl = QtWidgets.QLabel(label)
                 fl.setObjectName('field')
@@ -19481,8 +22711,10 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             return paths_settings_summary(self.user, self.studio)
 
         # easy setup (block mode)
-        EASY_ROLES = (('fixed', _t('그대로 (고정 폴더)', 'Keep unchanged (fixed folder)')), ('project', _t('프로젝트', 'Project')), ('seq', _t('시퀀스', 'Sequence')), ('shot', _t('샷', 'Shot')),
-                      ('layer', _t('레이어', 'Layer')), ('version', _t('버전 (최신 기준)', 'Version (latest rule)')), ('any', _t('아무거나', 'Any')))
+        EASY_ROLES = _Rendered(lambda: (
+            ('fixed', _t('그대로 (고정 폴더)', 'Keep unchanged (fixed folder)')), ('project', ROLE_UI['project'][1]),
+            ('seq', ROLE_UI['seq'][1]), ('shot', ROLE_UI['shot'][1]), ('layer', ROLE_UI['layer'][1]),
+            ('version', _t('버전 (최신 기준)', 'Version (latest rule)')), ('any', ROLE_UI['any'][1])))
 
         def _build_easy(self, page):
             el = QtWidgets.QVBoxLayout(page)
@@ -19563,11 +22795,12 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             lt = QtWidgets.QLabel(_t('역할', 'Roles'))
             lt.setObjectName('field')
             lg.addWidget(lt)
+            self._legend = []
             for r in ('project', 'seq', 'shot', 'layer', 'version', 'any', 'frame'):
-                c, lab = ROLE_UI[r]
-                x = QtWidgets.QLabel('<span style="color:%s">■</span> %s' % (c, lab))
+                x = QtWidgets.QLabel(self._legend_text(r))
                 x.setTextFormat(Qt.RichText)
                 lg.addWidget(x)
+                self._legend.append((x, r))
             lg.addStretch(1)
             el.addLayout(lg)
             t = QtWidgets.QLabel(_t('3. 이 스크립트가 어느 샷인지 알아내는 방법', "3. How the script's shot is identified"))
@@ -19579,12 +22812,64 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             el.addWidget(self.lb_ctx_easy)
             el.addStretch(1)
 
+        def _legend_text(self, role):
+            return '<span style="color:%s">■</span> %s' % ROLE_UI[role]
+
+        def _mode_text(self, dev):
+            return (_t('템플릿 원문 · 토큰 · 설정 파일 층을 직접 고칩니다. 쉬운 설정과 같은 설정입니다', 'Edit template text, tokens, and settings layers directly. These are the same settings as Easy setup.') if dev else
+                    _t('예시 파일의 경로 블록에 역할을 붙이면 템플릿이 자동으로 만들어집니다', 'Assign roles to example path blocks to create templates automatically.'))
+
+        def _fit_segments(self):
+            """Size the [Easy setup | Developer mode] segments for the wider of the KO and EN labels in their own
+            (stylesheet-polished) bold font, so a language switch never clips the checked, bold label."""
+            for b, labels in getattr(self, '_seg_labels', ()):
+                b.ensurePolished()
+                bold = QtGui.QFont(b.font())
+                bold.setBold(True)
+                fm = QtGui.QFontMetrics(bold)
+                adv = fm.horizontalAdvance if hasattr(fm, 'horizontalAdvance') else fm.width
+                b.setMinimumWidth(max(adv(text) for text in labels) + 12 * 2 + 8)  # 12px side padding (QPushButton#seg) + borders + slack
+
+        def showEvent(self, event):
+            QtWidgets.QDialog.showEvent(self, event)
+            self._fit_segments()  # the stylesheet font is final only once the window is shown
+
+        def _language_changed(self, index):
+            """Language lives here: apply it to the main window (and its other open windows), then re-render this window."""
+            language = self.cb_language.itemData(index)
+            if not language:
+                return
+            parent = self.parent()
+            if parent is not None and hasattr(parent, '_language_changed'):
+                parent._language_changed(language)
+            else:
+                set_ui_language(language, persist=True)
+            for widget in [self] + list(self.findChildren(QtWidgets.QWidget)):
+                if isinstance(widget, (QtWidgets.QAbstractButton, QtWidgets.QLabel)):
+                    widget.setText(_t_rendered(widget.text()))
+                if widget.toolTip():
+                    widget.setToolTip(_t_rendered(widget.toolTip()))
+                if hasattr(widget, 'placeholderText') and widget.placeholderText():
+                    widget.setPlaceholderText(_t_rendered(widget.placeholderText()))
+                if isinstance(widget, QtWidgets.QComboBox) and widget is not self.cb_language and not widget.isEditable():
+                    for item_index in range(widget.count()):
+                        widget.setItemText(item_index, _t_rendered(widget.itemText(item_index)))
+            self.setWindowTitle(_t_rendered(self.windowTitle()))
+            self.lb_mode.setText(self._mode_text(self.b_dev.isChecked()))
+            # texts assembled from path-token names and file paths are rebuilt, not looked up
+            self.lb_files.setText(self._files_text())
+            for label, role in self._legend:
+                label.setText(self._legend_text(role))
+            self._easy_retranslate()  # never _easy_load(): it would replace unsaved Easy setup input
+            for bar in self.bars.values():
+                bar.update()
+            self._fit_segments()
+
         def _set_mode(self, dev, save=True):
             if not dev:
                 self._easy_load()
             self.stack.setCurrentIndex(1 if dev else 0)
-            self.lb_mode.setText(_t('템플릿 원문 · 토큰 · 설정 파일 층을 직접 고칩니다. 쉬운 설정과 같은 설정입니다', 'Edit template text, tokens, and settings layers directly. These are the same settings as Easy setup.') if dev else
-                                 _t('예시 파일의 경로 블록에 역할을 붙이면 템플릿이 자동으로 만들어집니다', 'Assign roles to example path blocks to create templates automatically.'))
+            self.lb_mode.setText(self._mode_text(dev))
             if dev:
                 w = self.w[('context',)][0]
                 w.setFocus()
@@ -19627,19 +22912,38 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
                     lead, blocks = path_blocks(ex)
                     bar.set_path(lead, blocks, parts)
                     bar.setVisible(True)
-                    lab.setText(_t('예시: %s', 'Example: %s') % ex)
                 elif tm:
                     bar.set_path('/', [], [])
                     bar.setVisible(False)
-                    lab.setText(_t('지금 경로: %s\n개발자 모드에서 편집됐거나 공용 설정에서 온 경로라 블록으로 보일 수 없습니다. 예시 파일을 고르면 블록으로 새로 만듭니다.', 'Current path: %s\nThis path was edited in Developer mode or inherited from shared settings and cannot be shown as blocks. Choose an example file to rebuild the blocks.') % self._human(tm))
                 else:
                     bar.set_path('/', [], [])
                     bar.setVisible(True)
-                    lab.setText(_t('아직 없습니다 — [예시 파일 고르기…] 또는 [선택한 Read 에서 가져오기]', 'No example yet — choose an example file or use the selected Read.'))
-                self.prob_lbl[kind].setText('\n'.join(_path_diagnostic_display(t) for t in block_problems(bar.parts, kind)) if bar.blocks else '')
+                self._easy_label(kind, ex if ex and parts is not None else None, tm)
             self.le_layers.setText(', '.join(cfg['plate']['layers']))
             self.le_maxv.setText(str(cfg['plate']['max_version']) if cfg['plate']['max_version'] else '')
             self.le_excl.setText(', '.join(cfg['edit']['exclude_dirs']))
+            self._easy_ctx_text()
+
+        def _easy_label(self, kind, ex, tm):
+            """Example / guidance line and block problems under one Easy setup path bar (current language)."""
+            bar, lab = self.bars[kind], self.ex_lbl[kind]
+            if ex:
+                lab.setText(_t('예시: %s', 'Example: %s') % ex)
+            elif tm:
+                lab.setText(_t('지금 경로: %s\n개발자 모드에서 편집됐거나 공용 설정에서 온 경로라 블록으로 보일 수 없습니다. 예시 파일을 고르면 블록으로 새로 만듭니다.', 'Current path: %s\nThis path was edited in Developer mode or inherited from shared settings and cannot be shown as blocks. Choose an example file to rebuild the blocks.') % self._human(tm))
+            else:
+                lab.setText(_t('아직 없습니다 — [예시 파일 고르기…] 또는 [선택한 Read 에서 가져오기]', 'No example yet — choose an example file or use the selected Read.'))
+            self.prob_lbl[kind].setText('\n'.join(_path_diagnostic_display(t) for t in block_problems(bar.parts, kind)) if bar.blocks else '')
+
+        def _easy_retranslate(self):
+            """Language switch: re-render the Easy setup texts from what is on screen now. The fields, blocks and
+            role picks are not reloaded, so unsaved input survives."""
+            cfg = self._cur_cfg()
+            for kind in ('plate', 'edit'):
+                bar = self.bars[kind]
+                tm = (cfg['plate']['templates'] or [None])[0] if kind == 'plate' else (cfg['edit']['folders'] or [None])[0]
+                ex = self._examples.get(kind) if bar.blocks else None
+                self._easy_label(kind, ex, None if (ex or not bar.isHidden()) else tm)
             self._easy_ctx_text()
 
         def _easy_ctx_text(self):
@@ -20057,6 +23361,11 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             try:
                 if ev.type() == QtCore.QEvent.ToolTip and not self.on and obj not in self.keep and self._ours(obj):
                     return True
+                if ev.type() == QtCore.QEvent.ToolTip and ui_language() == 'en':
+                    tip = obj.toolTip()  # '1 frames' -> '1 frame' just before the tooltip shows
+                    fixed = _singular(tip)
+                    if fixed != tip:
+                        obj.setToolTip(fixed)
             except Exception:
                 pass
             return False
@@ -20099,7 +23408,7 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             return False
 
     class NMMRWindow(QtWidgets.QWidget):
-        def __init__(self, parent=None):
+        def __init__(self, parent=None, batch=False):
             QtWidgets.QWidget.__init__(self, parent, Qt.Tool)
             self.setObjectName('arWin')
             self.setAttribute(Qt.WA_StyledBackground, True)
@@ -20111,6 +23420,7 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             self._outcome = 'idle'
             self._srv = {}  # combo data key -> server info
             self.rows = []
+            self._script_id = _script_identity()  # the script this window's rows and results belong to
             self._manual_rois = {}  # stable PLATE key -> normalized EDIT content ROI
             self._plate_tc_rois = {}  # stable PLATE key -> normalized EDIT source-TC ROI
             self._tc_preflight_cache = {}
@@ -20131,14 +23441,6 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             self.lb_ctx.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Preferred)
             hr.addWidget(self.lb_ctx, 0)
             hr.addStretch(1)
-            self.cb_language = QtWidgets.QComboBox()
-            self.cb_language.setAccessibleName('Language')
-            self.cb_language.setToolTip(_t('언어 / Language', 'Language'))
-            self.cb_language.addItem('KO', 'ko')
-            self.cb_language.addItem('EN', 'en')
-            self.cb_language.setCurrentIndex(0 if ui_language() == 'ko' else 1)
-            self.cb_language.currentIndexChanged.connect(self._language_changed)
-            hr.addWidget(self.cb_language)
             self.b_top = _tool('top', '', '', None)  # always on top
             self.b_top.setCheckable(True)
             self.b_top.setAccessibleName('항상 위')
@@ -20147,17 +23449,17 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             self._tip_gate = TipGate(self)
             QtWidgets.QApplication.instance().installEventFilter(self._tip_gate)
             self.b_selection = _tool(
-                'node', '선택한 Read로 설정',
+                'node', '선택한 Read 불러오기',
                 '노드그래프에서 지금 선택한 Read 를 이 창의 EDIT / PLATE 입력으로 지정합니다. 창을 연 뒤 선택을 바꿨을 때 누릅니다.\n'
                 '· MP 1개 → 그 샷 기준 (경로 설정이 있으면 최신 편집본 자동)\n· MP + 편집본 mov → 둘 다 그대로\n'
                 '· MP 여러 개, 같은 샷 → 분할합성\n· MP 여러 개, 다른 샷 → 배치 탭',
                 lambda: self.apply_selection())
-            self.b_selection.setAccessibleName('선택한 Read로 설정')
+            self.b_selection.setAccessibleName('선택한 Read 불러오기')
             hr.addWidget(self.b_selection)
-            self.b_paths = _tool('gear', '경로 설정', '경로 설정 (⌘, / Ctrl+,)\n'
-                                 '샷 문맥 · 플레이트 · 편집본 폴더 구조를 경로 템플릿으로 지정합니다.\n'
-                                 '설정 전에는 공유 폴더 탐색이 꺼져 있고 씬의 Read 만 씁니다', self.open_paths)
-            self.b_paths.setAccessibleName('경로 설정')
+            self.b_paths = _tool('gear', '설정', '설정 (⌘, / Ctrl+,)\n'
+                                 '언어 · 샷 문맥 · 플레이트 · 편집본 폴더 구조를 경로 템플릿으로 지정합니다.\n'
+                                 '경로 설정 전에는 공유 폴더 탐색이 꺼져 있고 씬의 Read 만 씁니다', self.open_paths)
+            self.b_paths.setAccessibleName('설정')
             hr.addWidget(self.b_paths)
             sc_paths = (getattr(QtGui, 'QShortcut', None) or QtWidgets.QShortcut)(QtGui.QKeySequence('Ctrl+,'), self)  # macOS = Cmd+, (only while this window is active)
             sc_paths.setContext(Qt.WindowShortcut)
@@ -20173,7 +23475,7 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             self._tip_gate.keep = (self.b_tips,)
             self.refresh_sources()
             self._update_ctx_label()
-            self.apply_selection(initial=True)  # selected nodes take priority
+            self.apply_selection(initial=True, force_batch=batch)  # selected nodes take priority (once)
             self._install_key_router()
             self._set_state('idle')
             self._wire_done_release()
@@ -20190,8 +23492,8 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             _localize_tree(self)
             self._fit_header_tools()
 
-        def _language_changed(self, index):
-            language = self.cb_language.itemData(index)
+        def _language_changed(self, language):
+            """Apply a language already chosen in the settings window to this window and everything open under it."""
             if not language:
                 return
             set_ui_language(language, persist=True)
@@ -20203,7 +23505,6 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             self.lb_stat._suffix = self._stat_tip_suffix()
             self.lb_stat.setText(self.lb_stat.text())
             self._set_state(getattr(self, '_state_kind', 'idle'))
-            self.cb_language.setToolTip(_t('언어 / Language', 'Language'))
             for item_index, (key, label) in enumerate(OUT_NODES):
                 ok, why = retime_node_available(key)
                 self.cb_out.setItemText(item_index, _visible_ui_text(label) +
@@ -20226,6 +23527,11 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             self._update_review_label()
             self._update_tc_cache_label()
             self._update_adv_label()
+            self._update_tc_only_chip()
+            if getattr(self, '_tc_use_results', None) is not None:
+                self._set_tc_use(self._tc_use_results)  # last-run chips are built text: rebuild them in the new language
+            if getattr(self, '_nh_out', None) is not None:
+                self._set_nh(self._nh_out)
             self.b_run.setText(_t('실행 중…', 'Running…') if self._busy else _t('실행', 'Run'))
             self.cb_edit.retranslate()
             self.cb_plate.retranslate()
@@ -20312,12 +23618,13 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
                           '(편집본 폴더를 다시 검색하므로 공유 폴더 상태에 따라 몇 초 걸릴 수 있습니다. 취소 가능)',
                           lambda: self.refresh_sources(rescan=True))
             er.addWidget(b_ref)
+            self.b_ref = b_ref
             g.addWidget(flabel('EDIT', '편집본 — 리타임 기준이 되는 컷 (mov / 시퀀스)'), 0, 0)
             g.addLayout(er, 0, 1, 1, 2)
             mode, (self.rb_norm, self.rb_split) = _segmented(
                 ('일반', '분할합성'),
                 ('플레이트 1개 (보통의 샷)',
-                 '한 화면에 소스 플레이트가 여러 개 합성된 샷 — 체크한 플레이트마다 영역을 분리해 따로 리타임합니다'))
+                 '한 화면 안에 소스 플레이트 여러 개를 나란히(좌우·상하 등) 합성한 샷 — 플레이트 사이의 컷 전환이 아닙니다. 체크한 플레이트마다 영역을 분리해 따로 리타임합니다'))
             pv = QtWidgets.QVBoxLayout()
             pv.setSpacing(0)
             pv.addWidget(self.cb_plate)
@@ -20447,7 +23754,7 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             rr.setSpacing(8)
             roi_mode, (self.rb_roi_content, self.rb_roi_tc) = _segmented(
                 ('PLATE 영역', 'TC 영역'),
-                ('선택 PLATE가 보이는 EDIT 영역을 드래그합니다',
+                ('한 화면에 합성된 클립 하나가 보이는 EDIT 영역을 드래그합니다. 분할합성에서는 그 영역에 가장 잘 맞는 체크된 PLATE를 엔진이 고르며, 플레이트가 2개면 영역 하나만 그려도 나머지 화면은 다른 플레이트로 맞춥니다',
                  '선택 PLATE의 소스 TC 번인만 감싸도록 드래그합니다'))
             self.rb_roi_content.toggled.connect(self._roi_mode_changed)
             self.b_roi_clear = QtWidgets.QPushButton('영역 지우기')
@@ -20686,6 +23993,7 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             lay.setSpacing(8)
             r = QtWidgets.QHBoxLayout()
             r.setSpacing(6)
+            self._batch_tools = []  # locked while a run is active: they replace or drop self.rows
             for txt, kind, tip, fn in (
                     ('선택 MP 추가', 'plus', '노드그래프에서 선택한 MP(시퀀스) Read 를 행으로 추가합니다\n'
                      '같이 선택한 편집본 mov 는 샷코드로 짝지어 자동 최신 대신 사용합니다', self.add_selected),
@@ -20697,6 +24005,7 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
                 b.setToolTip(tip)
                 b.clicked.connect(fn)
                 r.addWidget(b)
+                self._batch_tools.append(b)
             r.addStretch(1)
             self.lb_batch = QtWidgets.QLabel('')
             self.lb_batch.setObjectName('dim')
@@ -20720,8 +24029,8 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             lay.addLayout(ff_row)
             self.tbl = BatchTable(0, 5)
             self.tbl.setHorizontalHeaderLabels(['MP', '샷', '편집본', 'First Frame', '상태'])
-            self.tbl.horizontalHeaderItem(2).setToolTip('더블클릭하면 다른 날짜 편집본을 고를 수 있습니다')
-            self.tbl.horizontalHeaderItem(3).setToolTip('전체 설정 상속 또는 이 행만 다른 First Frame 사용')
+            self.tbl.horizontalHeaderItem(2).setToolTip(_t('더블클릭하면 다른 날짜 편집본을 고를 수 있습니다', 'Double-click to choose another edit version.'))
+            self.tbl.horizontalHeaderItem(3).setToolTip(_t('전체 설정 상속 또는 이 행만 다른 First Frame 사용', 'Inherit global settings or use a row-specific First Frame.'))
             self.tbl.horizontalHeader().setStretchLastSection(True)
             self.tbl.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
             self.tbl.horizontalHeader().setHighlightSections(False)
@@ -20747,11 +24056,13 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             tl.setSpacing(8)
             self.cb_tc = QtWidgets.QCheckBox('렉TC 번인 사용')
             self.cb_tc.toggled.connect(self._preflight_source_changed)
-            self.cb_tc.setToolTip('편집본에 번인된 소스 TC 를 읽습니다 (TC 우선 모드)\n'
+            self.cb_tc.setToolTip('편집본에 번인된 소스 TC 를 읽습니다 (자동 모드)\n'
                                   '확신한 TC 가 충분하고(%d%% 이상) 플레이트 범위에 맞으면(%d%% 이상) 고정점으로 쓰고,\n'
                                   '이미지 매칭과 크게 어긋나는 TC 는 버립니다. 조건 미달이면 이미지 매칭이 주가 됩니다.\n'
                                   '배제 구간도 TC 로 정확한 정수 리타임이 됩니다' % (100 * TC_FIRST_COV, 100 * TC_FIRST_INRANGE))
             self.lb_tc = _badge('dim')
+            self.lb_tc_only = _badge('sel')  # shown while the TC only mode is selected (tone + text)
+            self.lb_tc_only.setVisible(False)
             self.lb_tc_use = _badge('dim')  # whether TC was used in the last run / coverage
             self.lb_tc_use.setVisible(False)
             self.lb_nh = _badge('dim')  # still segments of the last run (indistinguishable / weak evidence / confirmed by TC)
@@ -20761,10 +24072,11 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             self.lb_nh.installEventFilter(self._focus_tip)
             b_cal = QtWidgets.QPushButton('TC 보정…')
             b_cal.setToolTip('편집본에서 번인 TC 영역(ROI)을 지정하고 클립 전체로 판독을 테스트합니다\n'
-                             '(쇼 / 프로젝트당 한 번, 배치도 자동 사용)')
+                             '(프로젝트당 한 번. 배치도 자동으로 씁니다)')
             b_cal.clicked.connect(self.calibrate)
             tl.addWidget(self.cb_tc)
             tl.addWidget(self.lb_tc, 0)
+            tl.addWidget(self.lb_tc_only, 0)
             tl.addWidget(self.lb_tc_use, 0)
             tl.addWidget(self.lb_nh, 0)
             self._tc_hint = ''  # good | low | untested (disappears when you run)
@@ -20821,6 +24133,14 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             speed_row.addWidget(lb_speed)
             speed_row.addWidget(self.sp_max_speed)
             speed_row.addStretch(1)
+            # Retired option: the QC plate TC label is always one Group now (build_mp_label_group), so the
+            # checkbox had nothing left to switch. Hidden (takes no space); the saved key is still read, never acted on.
+            self.cb_qc_tc_group = QtWidgets.QCheckBox('QC 플레이트 TC 라벨 노드 묶기')
+            self.cb_qc_tc_group.setToolTip(QC_TC_GROUP_TIP)
+            self.cb_qc_tc_group.setChecked(bool(_ui_get('qc_plate_tc_group', False)))
+            self.cb_qc_tc_group.toggled.connect(lambda value: _ui_set('qc_plate_tc_group', bool(value)))
+            speed_row.addWidget(self.cb_qc_tc_group)
+            self.cb_qc_tc_group.setVisible(False)
             adv_row = (len(_OPTS) + 1) // 2
             al.addLayout(speed_row, adv_row, 0, 1, 2)
             # output mode (default TimeWarp). Unavailable modes are disabled + the reason in hover / focus detail
@@ -20862,6 +24182,46 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             orow.addWidget(self.cb_input)
             orow.addStretch(1)
             al.addLayout(orow, adv_row + 1, 0, 1, 2)
+            # QC Difference placement (default B pipe | side branch). Own row so the label and choices are not clipped; saved value kept
+            drow = QtWidgets.QHBoxLayout()
+            drow.setSpacing(8)
+            lb_diff = QtWidgets.QLabel('Difference 배치')
+            lb_diff.setObjectName('field')
+            self.cb_diff = QtWidgets.QComboBox()
+            for key, label in DIFF_LAYOUTS:
+                self.cb_diff.addItem(_visible_ui_text(label), key)
+            self.cb_diff.setCurrentIndex(max(0, self.cb_diff.findData(diff_layout_mode())))
+            diff_tip = _t(DIFF_LAYOUT_TIP, DIFF_LAYOUT_TIP_EN)
+            lb_diff.setToolTip(diff_tip)
+            self.cb_diff.setToolTip(diff_tip)
+            self.cb_diff.setFocusPolicy(Qt.TabFocus)
+            self.cb_diff.installEventFilter(self._focus_tip)
+            self.cb_diff.currentIndexChanged.connect(
+                lambda _i: (_ui_set('diff_layout', self.cb_diff.currentData()), self._update_adv_label()))
+            drow.addWidget(lb_diff)
+            drow.addWidget(self.cb_diff)
+            drow.addStretch(1)
+            al.addLayout(drow, adv_row + 2, 0, 1, 2)
+            # Batch result placement (default gather in one place | near the plates); the rows below move down by one
+            brow = QtWidgets.QHBoxLayout()
+            brow.setSpacing(8)
+            lb_bp = QtWidgets.QLabel('배치 결과 배치')
+            lb_bp.setObjectName('field')
+            self.cb_batch_place = QtWidgets.QComboBox()
+            for key, label in BATCH_PLACES:
+                self.cb_batch_place.addItem(_visible_ui_text(label), key)
+            self.cb_batch_place.setCurrentIndex(max(0, self.cb_batch_place.findData(batch_place_mode())))
+            bp_tip = _t(BATCH_PLACE_TIP, BATCH_PLACE_TIP_EN)
+            lb_bp.setToolTip(bp_tip)
+            self.cb_batch_place.setToolTip(bp_tip)
+            self.cb_batch_place.setFocusPolicy(Qt.TabFocus)
+            self.cb_batch_place.installEventFilter(self._focus_tip)
+            self.cb_batch_place.currentIndexChanged.connect(
+                lambda _i: (_ui_set('batch_place', self.cb_batch_place.currentData()), self._update_adv_label()))
+            brow.addWidget(lb_bp)
+            brow.addWidget(self.cb_batch_place)
+            brow.addStretch(1)
+            al.addLayout(brow, adv_row + 3, 0, 1, 2)
             curve_row = QtWidgets.QHBoxLayout()
             curve_label = QtWidgets.QLabel('lookup 키 보간')
             curve_label.setObjectName('field')
@@ -20877,7 +24237,32 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             curve_row.addWidget(curve_label)
             curve_row.addWidget(self.cb_lookup)
             curve_row.addStretch(1)
-            al.addLayout(curve_row, adv_row + 2, 0, 1, 2)
+            al.addLayout(curve_row, adv_row + 4, 0, 1, 2)
+            # Burn-in TC mode on its own row so the label and choices are not clipped.
+            # Not saved between sessions: every window opens on Auto, the default.
+            tcm_row = QtWidgets.QHBoxLayout()
+            tcm_row.setSpacing(8)
+            lb_tc_mode = QtWidgets.QLabel('번인 TC 모드')
+            lb_tc_mode.setObjectName('field')
+            lb_tc_mode.setToolTip(TC_MODE_TIP)
+            self.cb_tc_mode = QtWidgets.QComboBox()
+            for key, label in TC_MODE_CHOICES:
+                self.cb_tc_mode.addItem(label, key)
+            self.cb_tc_mode.setCurrentIndex(self.cb_tc_mode.findData(TC_MODE_PRIORITY))
+            self.cb_tc_mode.setToolTip(TC_MODE_TIP)
+            self.cb_tc_mode.setFocusPolicy(Qt.TabFocus)
+            self.cb_tc_mode.installEventFilter(self._focus_tip)
+            self.cb_tc_mode.setEnabled(self.cb_tc.isChecked())
+            self.cb_tc.toggled.connect(lambda on: self.cb_tc_mode.setEnabled(on and not getattr(self, '_busy', False)))
+            self.cb_tc.toggled.connect(self._update_tc_only_chip)
+            self.cb_tc_mode.currentIndexChanged.connect(self._update_tc_only_chip)
+            self.cb_tc_mode.currentIndexChanged.connect(self._update_adv_label)
+            self.cb_tc.toggled.connect(self._update_adv_label)
+            tcm_row.addWidget(lb_tc_mode)
+            tcm_row.addWidget(self.cb_tc_mode)
+            tcm_row.addStretch(1)
+            al.addLayout(tcm_row, adv_row + 5, 0, 1, 2)
+            self._update_tc_only_chip()
             temp_row = QtWidgets.QHBoxLayout()
             temp_row.setSpacing(8)
             lb_temp = QtWidgets.QLabel('임시 저장소')
@@ -20913,11 +24298,11 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             temp_row.addWidget(b_temp_pick)
             temp_row.addWidget(b_temp_reset)
             temp_row.addWidget(b_temp_open)
-            al.addLayout(temp_row, adv_row + 3, 0, 1, 2)
+            al.addLayout(temp_row, adv_row + 6, 0, 1, 2)
             self.lb_temp_path = ElideLabel('')
             self.lb_temp_path.setObjectName('dim')
             self.lb_temp_path.setToolTip(temp_tip)
-            al.addWidget(self.lb_temp_path, adv_row + 4, 0, 1, 2)
+            al.addWidget(self.lb_temp_path, adv_row + 7, 0, 1, 2)
             roi_row = QtWidgets.QHBoxLayout()
             roi_row.setSpacing(8)
             lb_roi = QtWidgets.QLabel('ROI 마스크 영구 저장소')
@@ -20933,7 +24318,7 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             roi_row.addWidget(lb_roi)
             roi_row.addWidget(self.ed_roi_path, 1)
             roi_row.addWidget(b_roi_open)
-            al.addLayout(roi_row, adv_row + 5, 0, 1, 2)
+            al.addLayout(roi_row, adv_row + 8, 0, 1, 2)
             cache_row = QtWidgets.QHBoxLayout()  # burn-in TC read cache: no automatic cleanup, the user clears it after confirming
             cache_row.setSpacing(8)
             lb_cache = QtWidgets.QLabel('번인 TC 판독 캐시')
@@ -20947,7 +24332,7 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             cache_row.addWidget(lb_cache)
             cache_row.addWidget(self.lb_tc_cache, 1)
             cache_row.addWidget(self.b_tc_cache_clear)
-            al.addLayout(cache_row, adv_row + 6, 0, 1, 2)
+            al.addLayout(cache_row, adv_row + 9, 0, 1, 2)
             self._update_tc_cache_label()
             self._update_temp_path_label()
             al.addWidget(self.b_tips, al.rowCount(), 0, 1, 2)
@@ -20960,7 +24345,7 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             rv = QtWidgets.QHBoxLayout()
             rv.setSpacing(8)
             self.cb_review = QtWidgets.QCheckBox('QC 리뷰 렌더')
-            self.cb_review.setToolTip('기본: 검증된 고정 Grade로 톤을 맞춘 RGB Difference. 보정 불가 시 화면에는 DIFF만 표시합니다. 추가 로컬 렌더가 필요합니다. 구조 강조는 별도 보기이며 실제 Difference와 다릅니다.')
+            self.cb_review.setToolTip('기본: 검증된 고정 Grade로 톤을 맞춘 RGB Difference. 룩이 적용되면 화면에 DIFF / LOOK MATCH를 표시하고 보류되면 DIFF만 표시합니다. 추가 로컬 렌더가 필요합니다. 구조 강조는 별도 보기이며 실제 Difference와 다릅니다.')
             self.lb_review = QtWidgets.QLabel('')
             self.lb_review.setObjectName('dim')
             rv.addWidget(self.cb_review)
@@ -20982,10 +24367,10 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             self.cb_rv_resolution.setToolTip(
                 '기본 FHD. 화면비를 유지하며 맞추고, 텍스트는 최종 출력 해상도에 그립니다.')
             self.cb_mp_tc = QtWidgets.QCheckBox('MP TC 표시')
-            self.cb_mp_tc.setToolTip('지정한 번인 TC 영역 바로 위에 표시합니다. 위쪽 여백이 없으면 아래. TC 영역 미지정 시 오른쪽 아래를 기준으로 배치하며 미지정을 표시합니다. 직접 위치는 라벨 왼쪽 위 기준입니다.')
+            self.cb_mp_tc.setToolTip('지정한 번인 TC 영역 바로 위에 표시합니다. 위쪽 여백이 없으면 아래. TC 영역 미지정 시 오른쪽 아래를 기준으로 배치하며 미지정을 표시합니다. 직접 위치는 라벨 왼쪽 위 기준입니다. 노드 트리의 QC Difference 아래에도 같은 라벨을 붙입니다.')
             self.ed_rv_path = QtWidgets.QLineEdit()
-            self.ed_rv_path.setPlaceholderText('저장 위치 — 비우면 .nk 옆 qc_review/ 폴더에 자동 이름')
-            self.ed_rv_path.setToolTip('폴더(또는 MOV 파일 경로 / JPEG 는 ####가 든 경로)를 지정합니다\n비워 두면 스크립트 옆 qc_review/')
+            self.ed_rv_path.setPlaceholderText('저장 위치 — 비우면 .nk 옆 retime_QC_reviews/ 폴더에 자동 이름')
+            self.ed_rv_path.setToolTip('폴더(또는 MOV 파일 경로 / JPEG 는 ####가 든 경로)를 지정합니다\n비워 두면 스크립트 옆 retime_QC_reviews/')
             b_pick = QtWidgets.QPushButton('폴더…')
             b_pick.setToolTip('저장 폴더 고르기')
             b_pick.clicked.connect(self._pick_review_dir)
@@ -21024,13 +24409,16 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             for label, value in (('굵게', 'bold'), ('보통', 'regular')):
                 self.cb_rv_weight.addItem(label, value)
             self.cb_rv_weight.setCurrentIndex(max(0, self.cb_rv_weight.findData(_ui_get('review_mp_weight', 'bold'))))
-            self.cb_rv_weight.setToolTip('굵게는 Menlo Bold(macOS) / Consolas Bold(Windows) / DejaVu Sans Mono Bold(Linux)를 씁니다. 글꼴이 없으면 보통 글꼴로 표시하고 로그에 남깁니다.')
+            self.cb_rv_weight.setToolTip('굵게는 macOS에서 Menlo Bold, 그 밖의 시스템에서는 DejaVu Sans Mono Bold가 있으면 그것을, 없으면 Nuke에 들어 있는 Courier 10 Pitch Bold를 씁니다. 글꼴이 없으면 보통 글꼴로 표시하고 로그에 남깁니다.')
             self.cb_rv_weight.currentIndexChanged.connect(lambda _: _ui_set('review_mp_weight', self.cb_rv_weight.currentData()))
             for control, key, lo, hi, default in ((self.sp_rv_size, 'review_mp_size', 50, 200, QC_MP_SIZE_DEFAULT),
                     (self.sp_rv_opacity, 'review_mp_opacity', 0, 100, QC_MP_OPACITY_DEFAULT),
                     (self.sp_rv_x, 'review_mp_x', 0, 100, 75), (self.sp_rv_y, 'review_mp_y', 0, 100, 85)):
                 control.setRange(lo, hi)
-                control.setValue(int(_ui_get(key, default)))
+                try:
+                    control.setValue(int(_ui_get(key, default)))
+                except (TypeError, ValueError):
+                    control.setValue(default)
                 control.setMinimumWidth(56)
                 control.valueChanged.connect(lambda v, key=key: _ui_set(key, v))
             rl.addWidget(QtWidgets.QLabel('MP TC 위치'), 3, 0)
@@ -21045,6 +24433,21 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             rl.addWidget(self.sp_rv_opacity, 5, 1)
             rl.addWidget(QtWidgets.QLabel('글꼴'), 5, 2)
             rl.addWidget(self.cb_rv_weight, 5, 3, 1, 3)
+            self.cb_rv_render = QtWidgets.QComboBox()
+            for label, value in (('지금 Nuke에서 렌더', 'now'), ('Write 노드만 만들기 (렌더팜용)', 'write')):
+                self.cb_rv_render.addItem(label, value)
+            self.cb_rv_render.setCurrentIndex(max(0, self.cb_rv_render.findData(_ui_get('review_render', 'now'))))
+            self.cb_rv_render.setToolTip('Write 노드만 만들기: QC 리뷰 노드 그래프와 Write를 남기고 렌더하지 않습니다. 렌더팜에서 렌더하세요. 형식은 위에서 고른 MOV나 JPEG 그대로입니다.')
+            self.cb_rv_render.currentIndexChanged.connect(lambda _: _ui_set('review_render', self.cb_rv_render.currentData()))
+            self.cb_rv_render.currentIndexChanged.connect(self._update_review_label)
+            rl.addWidget(QtWidgets.QLabel('렌더 방식'), 6, 0)
+            rl.addWidget(self.cb_rv_render, 6, 1, 1, 5)
+            self.cb_rv_follow = QtWidgets.QCheckBox('기존 Write 설정 따르기')
+            self.cb_rv_follow.setToolTip('스크립트에 있는 Write 노드(스튜디오 설정)에서 색공간·코덱·압축·채널을 가져와 QC 리뷰 Write에 씁니다. 형식과 해상도는 위에서 고른 대로 두고 경로·프레임 범위·콜백은 따르지 않습니다. 색공간은 출력·디스플레이용(sRGB·Rec.709 등)만 따르고 log·linear 색공간은 따르지 않습니다. 끄면 NMMR 기본값을 씁니다.')
+            self.cb_rv_follow.setChecked(bool(_ui_get('review_follow_writes', True)))
+            self.cb_rv_follow.toggled.connect(lambda v: _ui_set('review_follow_writes', bool(v)))
+            rl.addWidget(self.cb_rv_follow, 7, 1, 1, 5)
+
             def sync_mp_controls(*_):
                 enabled = self.cb_mp_tc.isChecked()
                 self.cb_rv_position.setEnabled(enabled)
@@ -21059,7 +24462,7 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             root.addWidget(self.rev)
             (self.rb_rv_jpg if _ui_get('review_fmt', 'mov') == 'jpeg' else self.rb_rv_mov).setChecked(True)
             self.cb_rv_resolution.setCurrentIndex(max(0, self.cb_rv_resolution.findData(_ui_get('review_res', 'fhd'))))
-            self.cb_mp_tc.setChecked(bool(_ui_get('review_mp_tc', False)))
+            self.cb_mp_tc.setChecked(bool(_ui_get('review_mp_tc', QC_MP_TC_DEFAULT)))
             sync_mp_controls()
             self.ed_rv_path.setText(str(_ui_get('review_path', '') or ''))
             self.rb_rv_jpg.toggled.connect(lambda v: _ui_set('review_fmt', 'jpeg' if v else 'mov'))
@@ -21080,10 +24483,15 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             self.logw.setVisible(False)  # the log is collapsed (the last line is shown in the status line)
             root.addWidget(self.logw)
 
-            self.bar = QtWidgets.QProgressBar()
+            self.bar = ShimmerBar()
             self.bar.setRange(0, 1000)
             self.bar.setTextVisible(False)
             root.addWidget(self.bar)
+            self._hb_timer = QtCore.QTimer(self)  # shimmer + stall check; only runs while a job is busy
+            self._hb_timer.setInterval(HEARTBEAT_POLL_MS)
+            self._hb_timer.timeout.connect(self._hb_tick)
+            self._hb_stalled, self._hb_base, self._hb_written = False, '', None
+            self._hb_static = False
 
             br = QtWidgets.QHBoxLayout()
             br.setSpacing(8)
@@ -21171,8 +24579,9 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             self.b_run.setEnabled(not self._busy)
 
         def refresh_sources(self, rescan=False):
-            if getattr(self, '_scanning', False):  # pressed again while looking up (processEvents re-entry) is ignored
-                return
+            if getattr(self, '_scanning', False) or getattr(self, '_busy', False):
+                return  # pressed again while looking up (processEvents re-entry), or during a run, is ignored
+            self._clear_done()  # the input sources are rebuilt = a new job is being prepared
             nodes = _candidates()
             cfg = paths_config()[0]
             tok = self.ctx_tok if paths_active(cfg) else {}
@@ -21399,13 +24808,17 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             self.timeline.set_data(ef, el, small)
             self.timeline.fps = node_fps(edit, ef)
             self.grip.setVisible(True)
-            self.set_preview_height(int(_ui_get('preview_h', 220)))
+            try:
+                preview_h = int(_ui_get('preview_h', 220))
+            except (TypeError, ValueError):
+                preview_h = 220
+            self.set_preview_height(preview_h)
             self._set_transport_enabled(True)
             self.b_strip.setText(_t('다시 불러오기', 'Reload'))
             self.lb_range.setText('/ %d–%d' % (ef, el))
             self._paint_strip()
             self._show_frame(ef)
-            self.lb_stat.setText(_t('타임라인 %d프레임', 'Timeline · %d frames') % (el - ef + 1))
+            self.lb_stat.setText(_singular(_t('타임라인 %d프레임', 'Timeline · %d frames') % (el - ef + 1)))
             self._set_state('idle')
             self.timeline.setFocus()
 
@@ -21792,12 +25205,15 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
               - one sequence -> look up the server edit again for that shot + assign PLATE
               - mov selected -> assign EDIT
             """
+            self._sync_script()  # rows of another script must not mix into this one
             movs, seqs = _selected_reads()
+            self._sel_sig = _read_names(movs + seqs)  # the selection that last filled this window
             if not movs and not seqs:
                 if not initial:
                     self.log(_t('선택된 Read 없음 — 스크립트 기준 유지',
                                 'No Reads selected — keeping the script context.'))
                 return
+            self._clear_done()  # loading Reads = preparing a new job
             original_sequence_count = len(seqs)
             hinted_edits, hinted_plates, _ambiguous = batch_selected_read_roles(movs, seqs)
             explicit_movie_plates = len(hinted_plates) > original_sequence_count
@@ -21915,11 +25331,11 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             else:
                 tip = _t('기준: %s\n현재 경로가 자동 감지 템플릿과 맞지 않습니다.\n'
                          '플레이트와 편집본 Read를 직접 선택하면 계속 실행할 수 있습니다.\n'
-                         '자동 감지가 필요하면 [경로 설정]에서 템플릿을 확인하거나 [선택한 Read로 설정]를 사용하세요.\n'
+                         '자동 감지가 필요하면 [경로 설정]에서 템플릿을 확인하거나 [선택한 Read 불러오기]를 사용하세요.\n'
                          '이 표시는 경로 자동 감지 상태이며 리타임 분석 결과가 아닙니다.',
                          'Context: %s\nThe current path does not match a discovery template.\n'
                          'Select plate and edit Reads manually to continue.\n'
-                         'For automatic discovery, check Path setup or use Use selected Reads.\n'
+                         'For automatic discovery, check Path setup or use Load selected Reads.\n'
                          'This is a path-discovery status, not a retime analysis result.') % src
             self.lb_ctx.setToolTip(tip)
 
@@ -21937,6 +25353,8 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
                 row['out'] = _first_frame_token(setting)
 
         def add_selected(self):
+            if self._busy:
+                return
             movs, seqs = _selected_reads()
             resolved = self._resolve_batch_selection(movs, seqs)
             if resolved is None:
@@ -21946,7 +25364,9 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
 
         def add_nodes(self, seqs, movs=()):
             """ add an MP row. If the edit mov selected together is that shot, use it instead of the latest on the server"""
-            have = set(id(r['mp']) for r in self.rows)
+            self._clear_done()
+            # by node name: nuke.selectedNodes() returns a new Python wrapper each call, so id() never matches
+            have = set(_node_key(r['mp']) for r in self.rows)
             cfg = paths_config()[0]
             tick = self._scan_tick(cfg) if paths_active(cfg) else None  # time limit / cancel / screen refresh
             if tick is not None:
@@ -21961,19 +25381,26 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
         def _add_rows(self, seqs, movs, have, tick):
             path_pairing = paths_active(paths_config()[0])
             for n in seqs:
-                if id(n) in have:
+                if _node_key(n) in have:
                     continue
+                have.add(_node_key(n))
                 row = batch_row_for(n, self.log, tick)
                 batch_apply_selected_edits(row, n, movs, path_pairing)
                 self.rows.append(row)
 
         def remove_rows(self):
+            if self._busy:
+                return
+            self._clear_done()
             idx = sorted(set(i.row() for i in self.tbl.selectedIndexes()), reverse=True)
             for i in idx:
                 del self.rows[i]
             self._fill_table()
 
         def rescan_rows(self):
+            if self._busy:
+                return
+            self._clear_done()
             _EDIT_SCAN_CACHE.clear()
             cfg = paths_config()[0]
             tick = self._scan_tick(cfg) if paths_active(cfg) else None
@@ -22027,6 +25454,7 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
                             if choice['path'] == row.get('mov')), 0)
             s, ok = QtWidgets.QInputDialog.getItem(self, _t('편집본', 'Edit'), row['shot'] or '', names, cur, False)
             if ok:
+                self._clear_done()
                 batch_select_edit_choice(row, choices, names.index(s))
                 self._fill_table()
 
@@ -22034,8 +25462,8 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             self.tbl.setRowCount(len(self.rows))
             for i, r in enumerate(self.rows):
                 snapshot_batch_plate(r)
-                live = batch_plate_is_live(r)
-                if not live:
+                live = batch_row_display_live(r, self._busy)
+                if not live and not self._busy:
                     r['status'] = batch_deleted_plate_status()
                 mp_name, mp_path = batch_plate_display(r)
                 choice_count = len(batch_edit_choices(r))
@@ -22064,7 +25492,7 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             def update_ff(ff, r):
                 ff._batch_row = r
                 ff.set_setting(r.get('out'))
-                ff.setEnabled(not self._busy and batch_plate_is_live(r))
+                ff.setEnabled(not self._busy and batch_row_display_live(r, False))
 
             sync_batch_cell_widgets(self.tbl, self.rows, 3, make_ff, update_ff)
             self.tbl.resizeColumnsToContents()
@@ -22075,10 +25503,10 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
                     self.tbl.setColumnWidth(j, 260)
             n = len(self.rows)
             done = sum(1 for r in self.rows if r['status'].startswith('완료'))
-            fail = sum(1 for r in self.rows if r['status'].startswith('실패'))
-            ready = sum(1 for r in self.rows if r.get('mov') and batch_plate_is_live(r))
+            fail = sum(1 for r in self.rows if r['status'].startswith(('실패', 'Failed')))  # stored in the language of the moment
+            ready = sum(1 for r in self.rows if r.get('mov') and batch_row_display_live(r, self._busy))
             self.b_ff_all.setEnabled(bool(self.rows) and not self._busy)
-            self.lb_batch.setText((_t('%d샷 · 실행 가능 %d', '%d shots · %d ready') % (n, ready) +
+            self.lb_batch.setText((_singular(_t('%d샷 · 실행 가능 %d', '%d shots · %d ready') % (n, ready)) +
                                    (_t(' · 완료 %d', ' · %d complete') % done if done else '') +
                                    (_t(' · 실패 %d', ' · %d failed') % fail if fail else ''))
                                   if n else '')
@@ -22110,8 +25538,8 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
                               '\nCalibration file from 4.x — the region is reused; old digit templates are ignored.')
                 if low:
                     tip += _t(
-                        '\n\n마지막 테스트 커버리지가 %d%% 미만 — 실행 시 TC 우선 모드가 꺼지고 이미지 매칭이 주가 됩니다',
-                        '\n\nLast test coverage is below %d%% — TC priority is disabled and image matching is used.') % (
+                        '\n\n마지막 테스트 커버리지가 %d%% 미만 — 실행 시 자동 모드의 TC 고정점이 꺼지고 이미지 매칭이 주가 됩니다',
+                        '\n\nLast test coverage is below %d%% — Auto mode TC anchors are disabled and image matching is used.') % (
                             100 * TC_FIRST_COV)
                 self.lb_tc.setToolTip(tip)
                 if sync_enabled:
@@ -22119,8 +25547,8 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
                 hint = {
                     'good': _t('이제 [실행]을 누르면 TC를 함께 씁니다',
                                'Click [Run] to use TC with image matching.'),
-                    'low': _t('판독이 낮아 TC 우선 모드는 꺼집니다 — [TC 보정…] 에서 영역이나 입력을 다시 확인하세요',
-                              'TC priority is disabled because the read rate is low — review the region or entered TC in [Calibrate TC…].'),
+                    'low': _t('판독이 낮아 자동 모드의 TC 고정점은 꺼집니다 — [TC 보정…] 에서 영역이나 입력을 다시 확인하세요',
+                              'Auto mode TC anchors are disabled because the read rate is low — review the region or entered TC in [Calibrate TC…].'),
                     'untested': _t('테스트 없이 저장했습니다 — 실행 뒤 TC 배지로 사용 여부를 확인해 주세요',
                                    'Saved without a test — check the TC badge after running to see whether TC was used.'),
                 }.get(self._tc_hint, '')
@@ -22188,6 +25616,7 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             ef, el = edit.firstFrame(), edit.lastFrame()
             opts = self._opts()
             opts['tc'] = True
+            opts['tc_mode'] = TC_MODE_PRIORITY  # the preflight checks TC against the image path
             ex_frames, pins = self._sets_quiet()
             excl = np.array([f in ex_frames for f in range(ef, el + 1)], bool)
             self._busy, self._cancel = True, False
@@ -22261,6 +25690,17 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
                 self._sync_roi_ui()
 
         # run
+        def _update_tc_only_chip(self, *_):
+            """Main-window chip while burn-in TC runs in the TC only mode (it overrides image-based timing)."""
+            lb = getattr(self, 'lb_tc_only', None)
+            cb = getattr(self, 'cb_tc_mode', None)
+            if lb is None:
+                return
+            on = cb is not None and tc_only_chip_visible(self.cb_tc.isChecked(), cb.currentData())
+            lb.setText(_t('TC만', 'TC only'))
+            lb.setToolTip(TC_MODE_TIP if ui_language() != 'en' else _UI_TEXT_EN.get(TC_MODE_TIP, TC_MODE_TIP))
+            lb.setVisible(on)
+
         def _update_adv_label(self, *_):
             on = sum(1 for c in self.checks.values() if c.isChecked())
             n = len(self.checks)
@@ -22271,21 +25711,34 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             key = (cb.currentData() if cb is not None else None) or 'timewarp'
             olab = dict(OUT_NODES).get(key, key)
             olab_ui = _visible_ui_text(olab)
-            txt = _t('기본값', 'Default') if not changed else _t('변경됨 · %d/%d 켜짐', 'Changed · %d/%d enabled') % (on, n)
+            # Header text: 'Default' only when nothing differs from the defaults; every differing setting is listed.
+            parts = []
+            if changed:
+                parts.append(_t('%d/%d 켜짐', '%d/%d enabled') % (on, n))
             max_speed = self.sp_max_speed.value() if hasattr(self, 'sp_max_speed') else 16
             if max_speed != 16:
-                txt = (_t('변경됨 · 최대 %d×', 'Changed · max %d×') % max_speed) if txt == _t('기본값', 'Default') else txt + _t(' · 최대 %d×', ' · max %d×') % max_speed
+                parts.append(_t('최대 %d×', 'max %d×') % max_speed)
             if key != 'timewarp':
-                txt = (_t('출력 %s', 'Output %s') % olab_ui) if on == n else txt + _t(' · 출력 %s', ' · output %s') % olab_ui
+                parts.append(_t('출력 %s', 'output %s') % olab_ui)
             curve = getattr(self, 'cb_lookup', None)
             if curve is not None and curve.currentData() == 'legacy':
-                txt += ' · lookup Constant'
+                parts.append('lookup Constant')
             cb_in = getattr(self, 'cb_input', None)
             if cb_in is not None and cb_in.currentData() == 'stamp':
-                txt += _t(' · 입력 PostageStamp', ' · input PostageStamp')
+                parts.append(_t('입력 PostageStamp', 'input PostageStamp'))
+            cb_diff = getattr(self, 'cb_diff', None)
+            if cb_diff is not None and cb_diff.currentData() == 'branch':
+                parts.append(_t('Difference 옆 가지', 'Difference side branch'))
+            cb_bp = getattr(self, 'cb_batch_place', None)
+            if cb_bp is not None and cb_bp.currentData() == 'near':
+                parts.append(_t('플레이트 근처', 'near the plates'))
+            cb_tcm, ck_tc = getattr(self, 'cb_tc_mode', None), getattr(self, 'cb_tc', None)
+            if cb_tcm is not None and ck_tc is not None and tc_only_chip_visible(ck_tc.isChecked(), cb_tcm.currentData()):
+                parts.append(_t('TC만', 'TC only'))
             temp_custom = self._temp_path_value() if hasattr(self, 'ed_temp_path') else ''
             if temp_custom:
-                txt += _t(' · 임시 저장소 지정', ' · custom temporary storage')
+                parts.append(_t('임시 저장소 지정', 'custom temporary storage'))
+            txt = (_t('변경됨 · ', 'Changed · ') + ' · '.join(parts)) if parts else _t('기본값', 'Default')
             self.lb_adv.setText(txt)
             changed_ui = [_visible_ui_text(value) for value in changed]
             off_ui = [_visible_ui_text(value) for value in off]
@@ -22449,9 +25902,11 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             resolution = {'full': _t('원본', 'Original'),
                           'half': _t('원본의 절반', 'Half source')}.get(
                               self.cb_rv_resolution.currentData(), self.cb_rv_resolution.currentText())
-            self.lb_review.setText('%s · %s%s' % ('JPEG' if self.rb_rv_jpg.isChecked() else 'MOV',
-                                                  resolution,
-                                                  ' · MP TC' if self.cb_mp_tc.isChecked() else ''))
+            write_only = getattr(self, 'cb_rv_render', None) is not None and self.cb_rv_render.currentData() == 'write'
+            self.lb_review.setText('%s%s · %s%s' % (_t('Write 노드만 · ', 'Write node only · ') if write_only else '',  # render mode stays visible while the panel is folded
+                                                    'JPEG' if self.rb_rv_jpg.isChecked() else 'MOV',
+                                                    resolution,
+                                                    ' · MP TC' if self.cb_mp_tc.isChecked() else ''))
 
         def _toggle_review(self, v):
             self._update_review_label()
@@ -22479,20 +25934,80 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
                 self.logw.setVisible(v)
                 self._grow(self.logw.maximumHeight() + 8 if v else -(self.logw.maximumHeight() + 8), base)
 
+        def _hb_start(self):
+            """A job starts: fresh heartbeat, shimmer on (static display when Reduce Motion is requested)."""
+            _HEARTBEAT.start()
+            self._hb_modal = False
+            self._hb_static = reduce_motion_requested()
+            self._hb_stalled, self._hb_base, self._hb_written = False, '', None
+            _HEARTBEAT.pulse = self._hb_pulse
+            self._hb_timer.start()
+
+        def _hb_stop(self):
+            """Job ended or cancelled: no shimmer, no timer, no leftover stall suffix."""
+            self._hb_timer.stop()
+            _HEARTBEAT.pulse = None
+            _HEARTBEAT.stop()
+            if getattr(self, '_hb_modal', False):
+                self._hb_modal = False
+                _HEARTBEAT.resume()
+            self.bar.set_shimmer(None)
+            self._hb_stalled = False
+
+        def _hb_tick(self):
+            # A modal dialog (a confirmation, a result warning) waits for the user: no stall while it is open.
+            modal = QtWidgets.QApplication.activeModalWidget() is not None
+            if modal != getattr(self, '_hb_modal', False):
+                self._hb_modal = modal
+                (_HEARTBEAT.pause if modal else _HEARTBEAT.resume)()
+            idle = _HEARTBEAT.idle()
+            if idle >= _HEARTBEAT.stall_after:
+                if not self._hb_stalled:
+                    self._hb_stalled = True
+                    self._hb_base = self.lb_stat.text()
+                self.bar.set_shimmer(None)
+                self._hb_written = stall_status_text(self._hb_base, idle)
+                self.lb_stat.setText(self._hb_written)
+                return
+            if self._hb_stalled:  # progress is back: drop the suffix unless a new message replaced it
+                self._hb_stalled = False
+                if self.lb_stat.text() == self._hb_written:
+                    self.lb_stat.setText(self._hb_base)
+            self.bar.set_shimmer(None if self._hb_static else shimmer_phase(time.time()))
+
+        def _hb_pulse(self, now):
+            """A beat from inside a long call (the Qt timer cannot fire there): advance the shimmer and paint the
+            bar and status line right now, without running the event loop."""
+            self._hb_tick()
+            self.bar.repaint()
+            self.lb_stat.repaint()
+
         def log(self, s):
             # Authored messages are localized before names/paths are interpolated.
+            heartbeat()
+            s = _singular(s)
             _console(s)
             self.logw.appendPlainText(s)
             if not self.logw.isVisible():
-                self.lb_stat.setText(s.split('\n')[0][:300])
-            QtWidgets.QApplication.processEvents()
+                self.lb_stat.setText(_hb_gap_text(s.split('\n')[0][:300]))
+            self._pump_events()
 
         def _progress(self, frac, msg=None):
+            heartbeat()
+            msg = _singular(msg) if msg else msg
             self.bar.setValue(int(frac * 1000))
             self.lb_pct.setText('%d%%' % int(round(frac * 100)))
             if msg:
-                self.lb_stat.setText(msg)
-            QtWidgets.QApplication.processEvents()
+                self.lb_stat.setText(_hb_gap_text(msg))
+            self._pump_events()
+
+        def _pump_events(self, interval=0.05):
+            """Process UI events at most every `interval` seconds during a run. Each pass can repaint the
+            Node Graph, which costs more the larger the open script is; Cancel stays responsive."""
+            now = time.time()
+            if now - getattr(self, '_pumped_at', 0.0) >= interval:
+                self._pumped_at = now
+                QtWidgets.QApplication.processEvents()
 
         def _set_state(self, kind):
             """ status dot: idle gray / busy blue / ok green / warn yellow / err red (color + text together)"""
@@ -22526,11 +26041,15 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
         def _opts(self):
             o = dict((k, c.isChecked()) for k, c in self.checks.items())
             o['tc'] = self.cb_tc.isChecked()
+            o['tc_mode'] = tc_mode_value(self.cb_tc_mode.currentData()) if o['tc'] else TC_MODE_PRIORITY
+            o['qc_plate_tc_group'] = self.cb_qc_tc_group.isChecked()
             o['split'] = self.rb_split.isChecked()
             o['out'] = self._out_text()
             o['review'] = self.cb_review.isChecked()
             o['review_fmt'] = 'jpeg' if self.rb_rv_jpg.isChecked() else 'mov'
             o['review_res'] = self.cb_rv_resolution.currentData()
+            o['review_render'] = self.cb_rv_render.currentData()
+            o['review_follow_writes'] = self.cb_rv_follow.isChecked()
             o['review_mp_tc'] = self.cb_mp_tc.isChecked()
             o['review_mode'] = self.cb_rv_mode.currentData()
             o['review_mp_position'] = self.cb_rv_position.currentData()
@@ -22541,6 +26060,8 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             o['review_mp_y'] = self.sp_rv_y.value()
             o['review_path'] = self.ed_rv_path.text().strip()
             o['out_node'] = self.cb_out.currentData() or 'timewarp'
+            o['diff_layout'] = diff_layout_mode(self.cb_diff.currentData())
+            o['batch_place'] = batch_place_mode(self.cb_batch_place.currentData())
             o['lookup_interpolation'] = lookup_interpolation(self.cb_lookup.currentData())
             o['max_speed'] = int(self.sp_max_speed.value())
             o['temp_path'] = self._temp_path_value()
@@ -22555,7 +26076,13 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             signals = [self.tabs.currentChanged, self.ff_single.changed, self.ff_batch.changed,
                        self.tbl.itemChanged, self.cb_review.toggled, self.sp_max_speed.valueChanged]
             signals += [c.toggled for c in self.checks.values()]
-            signals += [cb.currentIndexChanged for cb in (self.cb_out, self.cb_input, self.cb_lookup)]
+            signals += [cb.currentIndexChanged for cb in (self.cb_out, self.cb_input, self.cb_diff, self.cb_lookup)]
+            kinds = ((QtWidgets.QCheckBox, 'toggled'), (QtWidgets.QRadioButton, 'toggled'),
+                     (QtWidgets.QComboBox, 'currentIndexChanged'), (QtWidgets.QSpinBox, 'valueChanged'),
+                     (QtWidgets.QDoubleSpinBox, 'valueChanged'), (QtWidgets.QLineEdit, 'textChanged'),
+                     (QtWidgets.QListWidget, 'itemSelectionChanged'))
+            # Sweep every input widget instead of a hand-kept list so new combos (Read/candidate pickers, review render, TC mode...) are covered
+            signals += done_release_signals(self.findChildren(QtWidgets.QWidget), kinds)
             for signal in signals:
                 signal.connect(self._clear_done)
 
@@ -22580,7 +26107,57 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             self.b_close.style().unpolish(self.b_close)
             self.b_close.style().polish(self.b_close)
             if left > 0:
-                QtCore.QTimer.singleShot(150, lambda: self._pulse_done(left - 1))
+                self._defer(150, lambda: self._pulse_done(left - 1))
+
+        def _defer(self, ms, fn):
+            """Single-shot call owned by this window: a window closed (and deleted) in between never runs it."""
+            timer = QtCore.QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(fn)
+            timer.timeout.connect(timer.deleteLater)
+            timer.start(ms)
+
+        def _sync_script(self, force=False):
+            """The script changed under the open window (another file loaded or the script closed): drop the batch
+            table, the finished-run state and the log, which describe nodes of the previous script. A running job is
+            never touched. force: the caller already knows the script changed (load / close callbacks).
+            A new script path alone is not a switch: saving (first save, Save As, a new version) renames the script
+            and keeps its nodes, so the window is reset only when the table's nodes are gone as well.
+            Returns True when the window was reset."""
+            if self._busy:
+                return False
+            now = _script_identity()
+            if not force:
+                if now == self._script_id:
+                    return False
+                if not self.rows or any(batch_row_nodes_live(row) for row in self.rows):
+                    self._script_id = now
+                    return False
+            self._script_id = now
+            self.rows = []
+            self._fill_table()
+            self._clear_done()
+            self._outcome, self._run_counts, self._rv_reveal = 'idle', None, None
+            self.b_reveal.setVisible(False)
+            self._set_state('idle')
+            self.bar.setValue(0)
+            self.lb_pct.setText('')
+            self.logw.clear()
+            self._tc_use_results = self._nh_out = None  # single-tab traces of the last run name nodes of the old script
+            self.lb_tc_use.setVisible(False)
+            self.lb_nh.setVisible(False)
+            self._set_cuts([])
+            self.lb_stat.setText(_t('대기', 'Waiting'))
+            try:
+                self.ctx_tok = script_tokens()
+                self.ctx = ctx_tuple(self.ctx_tok)
+                self._ctx_src = None
+                self._update_ctx_label()
+            except Exception:
+                pass
+            self.log(_t('스크립트가 바뀌어 이전 배치 표·완료 상태·로그를 비웠습니다',
+                        'The script changed: cleared the previous batch table, done state and log.'))
+            return True
 
         def _clear_done(self, *_):
             if not getattr(self, '_done_hl', False) or self._busy:
@@ -22597,6 +26174,8 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             self.b_close.setVisible(not on)
             self.ff_single.setEnabled(not on)
             self.ff_batch.setEnabled(not on)
+            for control in (self.cb_edit, self.cb_plate, self.lst_plate, self.b_ref):  # the tabs stay switchable so a running batch can be watched
+                control.setEnabled(not on)
             self.b_ff_all.setEnabled(not on and bool(self.rows))
             self.tbl.setEnabled(not on)
             for c in self.checks.values():
@@ -22606,7 +26185,14 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             self.cb_review.setEnabled(not on)
             self.cb_out.setEnabled(not on)
             self.cb_input.setEnabled(not on)
+            self.cb_diff.setEnabled(not on)
+            self.cb_batch_place.setEnabled(not on)
             self.cb_lookup.setEnabled(not on)
+            # every control added since 1.0.2 that changes what a run does, plus the source / settings entry points
+            self.cb_tc_mode.setEnabled(not on and self.cb_tc.isChecked())
+            for control in [self.cb_qc_tc_group, self.cb_rv_render, self.cb_rv_follow, self.b_selection, self.b_paths] + \
+                    self._batch_tools:
+                control.setEnabled(not on)
             for control in getattr(self, '_temp_controls', ()):
                 control.setEnabled(not on)
             if hasattr(self, 'b_tc_cache_clear'):  # cache clearing is not available while running
@@ -22620,14 +26206,19 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
                 self.bar.setValue(0)
                 self.lb_pct.setText('0%')
                 self._set_state('busy')
+                self._hb_start()
+            else:
+                self._hb_stop()
 
         def run(self):
             if self._busy:
                 return
+            self.logw.clear()
+            self._sync_script()  # after the clear: its one-line reason must stay in the log
             self._busy, self._cancel = True, False
             self._done_hl = False
             self._set_done_style(False)
-            self._run_counts = None
+            self._run_counts = self._run_need = None
             self._run_t0 = __import__('time').time()
             self._outcome = 'idle'
             self._rv_reveal = None
@@ -22639,7 +26230,7 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             if self._tc_hint:  # the guidance right after saving disappears when you run
                 self._tc_hint = ''
                 self.lb_tc_next.setText('')
-            self.logw.clear()
+            self._done_notice = None
             self.log('run v%s' % NMMR_DISPLAY_VERSION)
             set_render_watch(self._render_watch(0.1))
             quiet = quiet_host_progress()  # so the Nuke progress window does not steal focus while another app is in use
@@ -22660,6 +26251,8 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
                 self._quiet = None
                 self._busy = False
                 self._busy_ui(False)
+                if self.rows:
+                    self._fill_table()  # re-enable the per-row controls disabled during the run
                 self._set_state(self._outcome)
                 if self._outcome == 'idle':
                     self.lb_pct.setText('')
@@ -22667,13 +26260,17 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
                 if run_has_result(self._outcome, counts, self._cancel):
                     ok_n, total_n = counts if counts else (None, None)
                     done_args = (self._outcome, ok_n, total_n,
-                                 __import__('time').time() - self._run_t0, self._cancel)
+                                 __import__('time').time() - self._run_t0, self._cancel, self._run_need)
                     self._show_done(run_done_status_text(run_done_headline(*done_args), self.lb_stat.text()))
                     self._stat_redo = (lambda args=done_args: run_done_headline(*args), self.lb_stat.text())
+                    self._notify_done(run_done_headline(*done_args))  # after the status line and [Close] emphasis
+                self._done_notice = None
                 if self.tabs.currentIndex() == 0 and self.timeline.cur is not None:
                     self.timeline.setFocus()  # Space = play after a run as well (focus slipped from the [Run] that had been disabled)
 
         def _ctx(self, ask):
+            if ask is not None:
+                ask = _paused_ask(ask)
             return JobCtx(self.log, self._progress, lambda: self._cancel, ask)
 
         def _render_watch(self, span):
@@ -22749,9 +26346,10 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             ctx = self._ctx(ask)
             try:
                 is_new = any(node is edit for node in getattr(self, '_pending', ()))
+                new_plates = [plate for plate in plates if any(node is plate for node in getattr(self, '_pending', ()))]
                 pctx = ctx.sub(0.0, 0.88) if opts.get('review') else ctx  # the last segment is the review render's share
                 out = _job_env(opts, pctx, lambda: process_job(edit, plates, opts, pctx, ex, pins,
-                                                               edit_is_new=is_new))
+                                                               edit_is_new=is_new, new_plates=new_plates))
                 out['edit'] = edit
             except Cancelled as e:
                 self.lb_stat.setText(_t('취소됨 %s', 'Cancelled %s') % e)
@@ -22787,15 +26385,16 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             need = sum(1 for r in out['results'] if shot_review_reasons(r['res'], bool(out.get('coverage_review'))))
             self._run_counts = (len(out['results']) - need, len(out['results']))
             self._progress(1.0)
+            rv_status = self._review_status(out.get('review'))  # once: it also updates the Finder button and the outcome
             nh_all = out.get('near_hold') or []  # [(plate, segment, out_first)]
             self._set_cuts(cuts, nh_all, out.get('ef') or 0)
-            self.lb_stat.setText(_t('완료 — %d 플레이트', 'Complete — %d plates') % len(out['results']) +
+            self.lb_stat.setText(_singular(_t('완료 — %d 플레이트', 'Complete — %d plates') % len(out['results'])) +
                                  (_t('  ·  일치도 낮음: %s', '  ·  Low similarity: %s') % ', '.join(wlow) if wlow else '') +
                                  (_t('  ·  신뢰도 낮음: %s', '  ·  Low confidence: %s') % ', '.join(wconf) if wconf else '') +
                                  (_t('  ·  분절컷 의심 %d', '  ·  Possible cuts %d') % len(cuts) if cuts else '') +
                                  near_hold_status_line([s for _, sp, _ in nh_all for s in sp]) +
                                  interp_slow_status_line([r['res'] for r in out['results']]) +
-                                 self._review_status(out.get('review')))
+                                 rv_status)
             msgs = []
             rv_msg = self._review_problem(out.get('review'))
             if rv_msg:
@@ -22806,6 +26405,8 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
                 d = near_hold_dialog(sp, pn, out.get('ef') or 0)
                 if d:
                     msgs.append(d)
+            for cm in out.get('composites') or []:
+                msgs.append('[%s] %s' % (cm['plate'], cm['desc']))
             if cuts:
                 msgs.append(_t('분절컷 의심 %d곳 — 리타임은 배속 변화만으로 연결했습니다:\n  ', 'Possible cuts at %d locations — the retime uses speed changes only:\n  ') % len(cuts) +
                             '\n  '.join('%s  EDIT %d %s' % (c['plate'], c['edit_frame'], c['desc']) for c in cuts) +
@@ -22824,13 +26425,41 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
                 st = tc_status(r['res'])
                 if st and st[1] == 'warn':
                     msgs.append('[%s] %s\n%s' % (r['plate'].name(), st[0], st[2]))
-            if msgs:
-                QtWidgets.QMessageBox.warning(self, 'No More Manual Retime', '\n\n'.join(msgs))
+            reasons = result_review_reasons(out)
+            if reasons and not msgs:  # the headline says 'review needed': always say why
+                msgs.append(_t('확인이 필요한 항목이 있습니다 (결과는 만들어졌습니다):\n  ',
+                               'Some items need review (the result was created):\n  ') + '\n  '.join(reasons))
+            self._done_notice = dict(warns=msgs, detail=self._review_line(rv_status))  # shown by _notify_done after _show_done
+
+        def _review_line(self, rv_status):
+            """QC review result for the end-of-run window: the status-line text without its separator, or 'not run'"""
+            text = (rv_status or '').replace('  ·  ', '', 1).strip()
+            return text or _t('QC 리뷰 안 함', 'QC review not run')
+
+        def _notify_done(self, headline):
+            """One end-of-run window, after _show_done: a completion notice, or the existing warning window with the
+            completion headline on top. A cancelled run keeps only its warnings (the headline already says Cancelled)."""
+            notice, self._done_notice = getattr(self, '_done_notice', None), None
+            if not notice or self._outcome == 'err':
+                return
+            warns, detail = notice['warns'], notice['detail']
+            if self._cancel:
+                if warns:
+                    QtWidgets.QMessageBox.warning(self, 'No More Manual Retime', '\n\n'.join(warns))
+                return
+            text = headline + ('\n' + detail if detail else '')
+            if warns:
+                QtWidgets.QMessageBox.warning(self, 'No More Manual Retime', text + '\n\n' + '\n\n'.join(warns))
+            else:
+                QtWidgets.QMessageBox.information(self, 'No More Manual Retime', text)
 
         def _review_status(self, rv):
             """ QC review result -> status line text (+ Finder button)"""
             if not rv or 'ok' not in rv:
                 return ''
+            if rv.get('ok') and rv.get('write_only'):
+                return _t('  ·  QC 리뷰 Write 노드만 만듦 (렌더 안 함, %d샷 %d프레임) — 렌더팜에서 렌더: %s',
+                          '  ·  QC review: Write node only, not rendered (%d shots, %d frames) - render on the farm: %s') % (rv['shots'], rv['frames'], rv['path'])
             if rv.get('ok'):
                 self._rv_reveal = rv.get('reveal') or rv['path']
                 self.b_reveal.setVisible(True)
@@ -22845,6 +26474,7 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
 
         def _set_tc_use(self, results):
             """ TC usage / coverage badge of the last run (with several plates, based on the first plate + all in the tooltip)"""
+            self._tc_use_results = results  # kept so a language switch can rebuild the chip text
             sts = [st for st in (tc_status(r) for r in results) if st]
             if not sts:
                 self.lb_tc_use.setVisible(False)
@@ -22859,6 +26489,7 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
         def _set_nh(self, out):
             """ still-segment badge of the last run (indistinguishable = orange / weak evidence = gray / confirmed by TC or pin = green).
             Detail of evidence, handling, impact and how to confirm on hover and Tab focus (with several plates, the worst state + all)"""
+            self._nh_out = out  # kept so a language switch can rebuild the chip text
             ef = (out or {}).get('ef') or 0
             sts = []
             for r in (out or {}).get('results') or []:
@@ -22889,27 +26520,39 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             opts = self._opts()
             skip = self.cb_skip_long.isChecked()
             ctx = self._ctx(lambda msg: not skip)
+            queued = batch_rows_to_run(self.rows)  # skipped / cancelled / failed rows run again; finished ones stay
             for r in self.rows:
                 snapshot_batch_plate(r)
-                if r.get('mov') and batch_plate_is_live(r):
-                    r['status'] = '대기'
-                elif not batch_plate_is_live(r):
+                if not batch_plate_is_live(r):
                     r['status'] = batch_deleted_plate_status()
+                elif any(r is q for q in queued):
+                    r['status'] = '대기'
             self._fill_table()
             rv = {}
             with UndoGroup(_t('No More Manual Retime (배치)', 'No More Manual Retime (Batch)')):
                 run_batch(self.rows, opts, ctx, on_row=lambda r: self._fill_table(), review_out=rv)
                 select_only(rv.get('_owned_nodes') or ())
-            done = sum(1 for r in self.rows if r['status'].startswith('완료'))
-            clean = sum(1 for r in self.rows if r['status'].startswith('완료') and not r.get('review'))
+            self._fill_table()  # rows left as cancelled/waiting by a cancel are redrawn too
+            tally = batch_done_counts(self.rows)  # the one count behind the headline, the status line and the window
+            clean, need = tally[0], tally[1]
             self._outcome = 'ok' if clean == len(self.rows) else 'warn'
             self._run_counts = (clean, len(self.rows))
+            self._run_need = need
+            rv_status = self._review_status(rv)
             self.lb_stat.setText(_t('배치 완료 — %d/%d 샷', 'Batch complete — %d/%d shots') %
-                                 (done, len(self.rows)) + self._review_status(rv))
+                                 (clean + need, len(self.rows)) + rv_status)
             self._progress(1.0)
+            msgs = []
+            if not self._cancel:  # a cancel the user asked for is already shown in the headline
+                report = batch_result_report(self.rows)
+                if report:
+                    msgs.append(report)
             rv_msg = self._review_problem(rv)
             if rv_msg:
-                QtWidgets.QMessageBox.warning(self, 'No More Manual Retime', rv_msg)
+                msgs.append(rv_msg)
+            counts = _t('성공 %d · 확인 필요 %d · 건너뜀 %d · 실패 %d',
+                        'Succeeded %d · Needs review %d · Skipped %d · Failed %d') % tally
+            self._done_notice = dict(warns=msgs, detail=counts + '\n' + self._review_line(rv_status))  # shown by _notify_done
 
         # key router - left/right, Home/End, I/O and Space go to the timeline wherever the focus is
         _ROUTE = (Qt.Key_Left, Qt.Key_Right, Qt.Key_Home, Qt.Key_End, Qt.Key_I, Qt.Key_O, Qt.Key_Space)
@@ -22967,7 +26610,7 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
 
         def event(self, ev):
             if ev.type() == QtCore.QEvent.Show:
-                QtCore.QTimer.singleShot(0, self._tab_focus)  # set the combo policy that the style reverted back to TabFocus
+                self._defer(0, self._tab_focus)  # set the combo policy that the style reverted back to TabFocus
             elif ev.type() == QtCore.QEvent.WindowActivate and hasattr(self, 'lb_roi'):
                 self._sync_roi_ui()  # remove a stale TC badge after an external Read/color change
             # receive ESC before Nuke's global shortcuts
@@ -23032,11 +26675,11 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             if not hasattr(self, 'b_selection') or not hasattr(self, 'b_paths'):
                 return
             # Reserve the window margins, a useful slice of the context badge
-            # language/top/tips controls, and every header gap. The two actions
+            # top/tips controls, and every header gap. The two actions
             # retain their complete text and tooltips while rendered icon-only.
             chip = getattr(self, '_ctx_chip', None) or ('', '', '')
             name_w = self._set_ctx_chip(chip[0], chip[1], '')
-            fixed = 24 + sum(widget.sizeHint().width() for widget in (self.cb_language, self.b_top))
+            fixed = 24 + sum(widget.sizeHint().width() for widget in (self.b_top,))
             fixed += max(0, self._header_layout.spacing()) * 4
             # Priority+: labels of the header actions collapse before the shot name is cut.
             self._header_tools_compact = _refresh_header_tool_geometry(
@@ -23089,7 +26732,9 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
                 ev.ignore()
                 return
             global _WIN
-            _WIN = None
+            if _WIN is self:
+                _WIN = None
+                _unregister_script_callbacks()
             # also clean up thumbnails when only the timeline / TC calibration was used and closed without running
             try:
                 if self.checks['cleanup'].isChecked() and _USED_DIRS:
@@ -23098,8 +26743,12 @@ def _mk_window_classes(QtWidgets, QtCore, QtGui):
             except Exception:
                 pass
             ev.accept()
+            # An idle close destroys the window (as in 1.0.2): the next open builds a fresh one from the saved
+            # settings instead of reviving old rows, logs and node references.
+            self.deleteLater()
 
     NMMRWindow.TcCalibDialog = TcCalibDialog
+    NMMRWindow._nmmr_module = _MODULE_TOKEN  # show_window reuses only windows of this execution
     NMMRWindow.PathsDialog = PathsDialog  # path settings window (when opened directly by tests / other entry points)
     return NMMRWindow
 
@@ -23109,6 +26758,19 @@ def _selected_reads():
     sel = [n for n in nuke.selectedNodes() if n.Class() == 'Read' and not _is_tool_node_name(n)]
     sel.sort(key=lambda n: (n.xpos(), n.ypos()))
     return [n for n in sel if _is_movie(n)], [n for n in sel if not _is_movie(n)]
+
+
+def _node_key(node):
+    """Stable identity of a node across Python wrappers: its full name (id() only for a deleted node)."""
+    try:
+        return node.fullName()
+    except Exception:
+        return id(node)
+
+
+def _read_names(nodes):
+    """Selection fingerprint: the set of full node names."""
+    return frozenset(_node_key(n) for n in nodes)
 
 
 def _np_to_qimage_rgb(QtGui, img):
@@ -23499,8 +27161,120 @@ def show_numpy_installer(on_done=None, target_dir=None, vendor_extra=None):
     return dlg
 
 
-def show_window():
-    """ open the integrated GUI (bring to front if already open)"""
+def _script_identity():
+    """What tells one script from another for an open window: the script path (empty for an unsaved script)."""
+    try:
+        return str(nuke.root().name() or '')
+    except Exception:
+        return ''
+
+
+def _script_event():
+    """onScriptLoad / onScriptClose: the open window's rows and results belong to the script that just went away."""
+    win = _WIN
+    if win is None:
+        return
+    try:
+        win._sync_script(force=True)
+    except Exception as ex:
+        print('[No More Manual Retime] script-change refresh failed: %s' % ex)
+
+
+def _register_script_callbacks():
+    """Hook _script_event once. A re-paste executes this file again: the earlier execution's hook is removed first,
+    so a script switch never reaches the window twice."""
+    try:
+        old = getattr(nuke, '_nmmr_script_cb', None)
+        if old is not None:
+            for name in ('removeOnScriptLoad', 'removeOnScriptClose'):
+                try:
+                    getattr(nuke, name)(old)
+                except Exception:
+                    pass
+        nuke.addOnScriptLoad(_script_event)
+        nuke.addOnScriptClose(_script_event)
+        nuke._nmmr_script_cb = _script_event
+    except Exception as ex:
+        print('[No More Manual Retime] script-change hook unavailable: %s' % ex)
+
+
+def _unregister_script_callbacks():
+    """Called when the window is destroyed (a closed window has nothing to refresh)."""
+    try:
+        if getattr(nuke, '_nmmr_script_cb', None) is _script_event:
+            for name in ('removeOnScriptLoad', 'removeOnScriptClose'):
+                try:
+                    getattr(nuke, name)(_script_event)
+                except Exception:
+                    pass
+            nuke._nmmr_script_cb = None
+    except Exception:
+        pass
+
+
+def _open_window(QtWidgets):
+    """The NMMR window show_window may bring forward, or None.
+
+    Reused: a running window (of any execution of this file: a job is never interrupted), else a visible window
+    built by this execution. Every other NMMR window is retired: a visible one of an earlier execution (a re-paste
+    or reload; its methods are the old code) is closed, and closed-but-alive leftovers are deleted. A re-paste
+    starts with a fresh module global, so `_WIN` alone cannot find the earlier windows."""
+    found = None
+    try:
+        widgets = [_WIN] if _WIN is not None else []
+        widgets += [w for w in QtWidgets.QApplication.topLevelWidgets()
+                    if type(w).__name__ == 'NMMRWindow' and w is not _WIN]
+    except Exception:
+        return None
+    for widget in widgets:
+        try:
+            busy = bool(getattr(widget, '_busy', False))
+            visible = bool(widget.isVisible())
+        except Exception:  # the C++ window is already gone
+            continue
+        current = getattr(type(widget), '_nmmr_module', None) is _MODULE_TOKEN
+        if found is None and (busy or (visible and current)):
+            found = widget
+            continue
+        if busy:
+            continue
+        try:
+            if visible:
+                widget.close()
+            widget.deleteLater()
+        except Exception:
+            pass
+    return found
+
+
+def _release_done_emphasis(win, batch=False):
+    """Reopening a window starts a new job: drop the run-finished Close emphasis. The node-graph selection is
+    applied again only when it changed since it last filled the window, so EDIT / PLATE picked by hand in the
+    window survive a menu re-open with the same selection. batch: the selected-MP batch menu (applied once)."""
+    clear = getattr(win, '_clear_done', None)
+    if clear is not None:
+        clear()
+    if getattr(win, '_busy', False):
+        return
+    try:
+        win._sync_script()  # another script than the one this window was filled from: start clean
+    except Exception as ex:
+        print('[No More Manual Retime] script check on reopen failed: %s' % ex)
+    try:
+        if batch:
+            win.apply_selection(force_batch=True)
+            return
+        movs, seqs = _selected_reads()
+        names = _read_names(movs + seqs)
+        if names and names != getattr(win, '_sel_sig', None):
+            win.apply_selection(initial=True)
+    except Exception as ex:
+        print('[No More Manual Retime] selection refresh on reopen failed: %s' % ex)
+
+
+def show_window(batch=False):
+    """ open the integrated GUI (bring to front if already open). A closed window is gone, so reopening
+    builds a new one with the saved settings. batch: put the selected MPs on the batch tab."""
     global _WIN
     qt = _qt()
     if qt is None or qt[0].QApplication.instance() is None:
@@ -23510,16 +27284,20 @@ def show_window():
         from PySide6 import QtGui
     except ImportError:
         from PySide2 import QtGui
-    if _WIN is not None:
+    existing = _open_window(QtWidgets)
+    if existing is not None:
         try:
-            _WIN.show()
-            _WIN.raise_()
-            _WIN.activateWindow()
+            _release_done_emphasis(existing, batch)
+            existing.show()
+            existing.raise_()
+            existing.activateWindow()
+            _WIN = existing
             return _WIN
         except Exception:
-            _WIN = None
+            pass
     cls = _mk_window_classes(QtWidgets, QtCore, QtGui)
-    _WIN = cls(QtWidgets.QApplication.activeWindow())
+    _WIN = cls(QtWidgets.QApplication.activeWindow(), batch=batch)
+    _register_script_callbacks()
     _WIN.show()
     _place_over_dag(_WIN, QtWidgets, QtCore, QtGui)  # over the node graph
     return _WIN
@@ -23577,13 +27355,27 @@ def _ui_set(key, value):
         import json
         d = {}
         if os.path.exists(_ui_path()):
-            with open(_ui_path()) as f:
-                d = json.load(f)
+            try:
+                with open(_ui_path()) as f:
+                    d = json.load(f)
+                if not isinstance(d, dict):
+                    raise ValueError('not a JSON object')
+            except ValueError as ex:
+                # An unreadable settings file would make every later save fail silently: set it aside (never
+                # deleted, never overwriting an earlier copy) and start a new one.
+                d, bad, n = {}, _ui_path() + '.bad', 1
+                while os.path.exists(bad):
+                    n += 1
+                    bad = '%s.bad%d' % (_ui_path(), n)
+                os.rename(_ui_path(), bad)
+                print('[No More Manual Retime] unreadable UI settings moved to %s (%s)' % (bad, ex))
         d[key] = value
         if not os.path.isdir(os.path.dirname(_ui_path())):
             os.makedirs(os.path.dirname(_ui_path()))
-        with open(_ui_path(), 'w') as f:
+        tmp = _ui_path() + '.tmp'
+        with open(tmp, 'w') as f:  # write beside, then swap in: an interrupted save keeps the old file
             json.dump(d, f)
+        os.replace(tmp, _ui_path())
     except Exception:
         pass
 
@@ -23603,10 +27395,8 @@ def run(batch=False):
             return
         if np is None:
             return
-    w = show_window()
+    w = show_window(batch=batch)  # the selection is applied once, by the new or the reused window
     if w is not None:
-        if batch:
-            w.apply_selection(force_batch=True)
         return w
     run_classic()
 
@@ -23629,6 +27419,8 @@ def run_classic():
             task.setMessage(m)
     ctx = JobCtx(None, prog, task.isCancelled, nuke.ask)
     opts.setdefault('tc', True)
+    t0 = time.time()
+    out = None
     try:
         with UndoGroup('No More Manual Retime'):
             out = _job_env(opts, ctx, lambda: process_job(opts['edit'], opts['plates'], opts, ctx))
@@ -23640,7 +27432,23 @@ def run_classic():
                 qc_grade_requested=qc_look_requested(opts))
             _register_owned(backdrop, owned)
             select_only(owned)
-        msg = []
+    except Cancelled:
+        out = None
+    except Exception as e:
+        out = None
+        import traceback
+        traceback.print_exc()
+        finalize_failed_owned(e, '%s  EDIT %s' % (
+            node_context(opts['plates'][0])[2] or '', opts['edit'].name()), ctx.log)
+        nuke.message(_t('No More Manual Retime 실행에 실패했습니다:\n%s',
+                        'No More Manual Retime failed:\n%s') % e)
+    finally:
+        task.setProgress(100)
+    if out is None:
+        return
+    # The run succeeded: an error while summarizing it must never be reported as a failed run.
+    headline, msg = run_done_headline('ok'), []
+    try:
         if out.get('warn_quality'):
             wconf = [w for w in out['warn_quality'] if w in (out.get('warn_conf') or [])]
             msg.append(match_warning_message([w for w in out['warn_quality'] if w not in wconf], wconf,
@@ -23652,19 +27460,13 @@ def run_classic():
         if out.get('reframe_warn'):
             msg.append(_t('리프레임 출력 (Beta):', 'Reframe output (Beta):') +
                        '\n  ' + '\n  '.join(out['reframe_warn']))
-        if msg:
-            nuke.message('\n\n'.join(msg))
-    except Cancelled:
-        pass
-    except Exception as e:
+        need = sum(1 for r in out['results'] if shot_review_reasons(r['res'], bool(out.get('coverage_review'))))
+        headline = run_done_headline('warn' if result_review_reasons(out) else 'ok',
+                                     len(out['results']) - need, len(out['results']), time.time() - t0)
+    except Exception:
         import traceback
         traceback.print_exc()
-        finalize_failed_owned(e, '%s  EDIT %s' % (
-            node_context(opts['plates'][0])[2] or '', opts['edit'].name()), ctx.log)
-        nuke.message(_t('No More Manual Retime 실패했습니다:\n%s',
-                        'No More Manual Retime failed:\n%s') % e)
-    finally:
-        task.setProgress(100)
+    nuke.message('\n\n'.join([headline] + msg))  # always one end-of-run message, warnings below the headline
 
 
 # works immediately even if the file contents are pasted into the Script Editor and run
